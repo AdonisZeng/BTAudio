@@ -8,6 +8,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
+void ApplyTheme();
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -75,6 +76,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	g_nid.hWnd = g_niid.hWnd = g_hWnd;
 	wcscpy_s(g_nid.szTip, _(L"BTAudio"));
 	UpdateNotifyIcon();
+	ApplyTheme();
 
 	WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
 	LOG_LAST_ERROR_IF(WM_TASKBAR_CREATED == 0);
@@ -123,6 +125,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (lParam && CompareStringOrdinal(reinterpret_cast<LPCWCH>(lParam), -1, L"ImmersiveColorSet", -1, TRUE) == CSTR_EQUAL)
 		{
 			UpdateNotifyIcon();
+			ApplyTheme();
 		}
 		break;
 	case WM_NOTIFYICON:
@@ -442,11 +445,38 @@ void SetupSvgIcon()
 	g_hIconDark = SvgTohIcon(svg, width, height, { 1, 1, 1, 1 });
 }
 
-void UpdateNotifyIcon()
+bool IsSystemLightTheme()
 {
 	DWORD value = 0, cbValue = sizeof(value);
 	LOG_IF_WIN32_ERROR(RegGetValueW(HKEY_CURRENT_USER, LR"(Software\Microsoft\Windows\CurrentVersion\Themes\Personalize)", L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &cbValue));
-	g_nid.hIcon = value != 0 ? g_hIconLight : g_hIconDark;
+	return value != 0;
+}
+
+void ApplyTheme()
+{
+	auto theme = IsSystemLightTheme() ? ElementTheme::Light : ElementTheme::Dark;
+
+	g_xamlCanvas.RequestedTheme(theme);
+
+	if (g_xamlFlyout)
+	{
+		if (auto content = g_xamlFlyout.Content().try_as<FrameworkElement>())
+			content.RequestedTheme(theme);
+	}
+
+	if (g_xamlMenu)
+	{
+		for (auto const& item : g_xamlMenu.Items())
+		{
+			if (auto fe = item.try_as<FrameworkElement>())
+				fe.RequestedTheme(theme);
+		}
+	}
+}
+
+void UpdateNotifyIcon()
+{
+	g_nid.hIcon = IsSystemLightTheme() ? g_hIconLight : g_hIconDark;
 
 	if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid))
 	{

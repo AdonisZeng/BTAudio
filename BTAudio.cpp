@@ -301,6 +301,15 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
+			// Avoid duplicate connections to the same device. emplace won't overwrite
+			// an existing key, which would create multiple AudioPlaybackConnection
+			// objects competing for the same Bluetooth link and cause audio stutter.
+			auto existing = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+			if (existing != g_audioPlaybackConnections.end())
+			{
+				existing->second.second.Close();
+				g_audioPlaybackConnections.erase(existing);
+			}
 			g_audioPlaybackConnections.emplace(device.Id(), std::pair(device, connection));
 
 			connection.StateChanged([](const auto& sender, const auto&) {
@@ -312,7 +321,9 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
 						g_audioPlaybackConnections.erase(it);
 					}
-					sender.Close();
+					// Do not call sender.Close() here. The connection is already in the
+					// Closed state and the map entry has been erased, so calling Close()
+					// again is redundant and risks reentrancy within the event callback.
 				}
 			});
 

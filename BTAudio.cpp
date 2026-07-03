@@ -506,7 +506,7 @@ void SetupMainWindow()
 
 	// Title bar
 	TextBlock titleText;
-	titleText.Text(L"BTAudio");
+	titleText.Text(L"BTAudio " BTAUDIO_VERSION_WSTR);
 	titleText.FontSize(18);
 	titleText.FontWeight(FontWeights::SemiBold());
 	titleText.VerticalAlignment(VerticalAlignment::Center);
@@ -791,8 +791,14 @@ void RefreshDeviceList()
 				disconnectButton.Content(winrt::box_value(L"\xE8BB"));
 				disconnectButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
 				disconnectButton.FontSize(10);
+				disconnectButton.Padding(ThicknessHelper::FromUniformLength(0));
+				disconnectButton.MinWidth(28);
+				disconnectButton.MinHeight(28);
 				disconnectButton.Width(28);
 				disconnectButton.Height(28);
+				disconnectButton.Margin({ 4, 0, 0, 0 });
+				disconnectButton.HorizontalContentAlignment(HorizontalAlignment::Center);
+				disconnectButton.VerticalContentAlignment(VerticalAlignment::Center);
 				disconnectButton.Background(SolidColorBrush(Colors::Transparent()));
 				disconnectButton.Foreground(SolidColorBrush(Colors::Gray()));
 				disconnectButton.HorizontalAlignment(HorizontalAlignment::Right);

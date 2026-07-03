@@ -1,9 +1,19 @@
 //{{NO_DEPENDENCIES}}
 // Microsoft Visual C++ generated include file.
-// Used by BTAudio.rc
+// Used by BTAudio.rc and BTAudio.cpp
 //
 #define IDI_BTAUDIO      1
 #define IDC_STATIC                      -1
+
+// Version information — single source of truth for both .rc and C++ code.
+#define BTAUDIO_VERSION_MAJOR      1
+#define BTAUDIO_VERSION_MINOR      1
+#define BTAUDIO_VERSION_PATCH      0
+#define BTAUDIO_VERSION_BUILD      0
+
+#define BTAUDIO_VERSION_STR        L"1.1.0.0"
+#define BTAUDIO_VERSION_WSTR       L"1.1"
+#define BTAUDIO_COPYRIGHT_STR      L"Copyright (C) 2020 Richard Yu, 2026 AdonisZeng"
 
 // Next default values for new objects
 // 

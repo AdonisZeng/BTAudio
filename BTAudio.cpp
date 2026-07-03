@@ -14,6 +14,7 @@ void SetupMainWindow();
 void ShowMainWindow();
 void HideMainWindow();
 void RefreshDeviceList();
+void ShowUpdateDialog();
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -88,6 +89,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	LOG_LAST_ERROR_IF(WM_TASKBAR_CREATED == 0);
 
 	PostMessageW(g_hWnd, WM_CONNECTDEVICE, 0, 0);
+
+	// Silently check for updates on startup.
+	CheckForUpdate(true);
 
 	MSG msg;
 	while (GetMessageW(&msg, nullptr, 0, 0))
@@ -181,6 +185,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_REFRESHDEVICELIST:
 		RefreshDeviceList();
 		break;
+	case WM_UPDATEAVAILABLE:
+		ShowUpdateDialog();
+		break;
+	case WM_UPTODATE:
+		TaskDialog(g_hWnd, nullptr, L"BTAudio", _(L"You are using the latest version."), nullptr, TDCBF_OK_BUTTON, TD_INFORMATION_ICON, nullptr);
+		break;
+	case WM_UPDATEFAILED:
+		TaskDialog(g_hWnd, nullptr, L"BTAudio", _(L"Failed to check for updates. Please check your network connection and try again later."), nullptr, TDCBF_OK_BUTTON, TD_ERROR_ICON, nullptr);
+		break;
 	default:
 		if (WM_TASKBAR_CREATED && message == WM_TASKBAR_CREATED)
 		{
@@ -234,6 +247,16 @@ void SetupMenu()
 		winrt::Windows::System::Launcher::LaunchUriAsync(Uri(L"ms-settings:bluetooth"));
 	});
 
+	FontIcon updateIcon;
+	updateIcon.Glyph(L"\xE946"); // Refresh / Update icon
+
+	MenuFlyoutItem checkUpdateItem;
+	checkUpdateItem.Text(_(L"Check for Updates"));
+	checkUpdateItem.Icon(updateIcon);
+	checkUpdateItem.Click([](const auto&, const auto&) {
+		CheckForUpdate(false);
+	});
+
 	FontIcon closeIcon;
 	closeIcon.Glyph(L"\xE8BB");
 
@@ -269,6 +292,7 @@ void SetupMenu()
 
 	MenuFlyout menu;
 	menu.Items().Append(settingsItem);
+	menu.Items().Append(checkUpdateItem);
 	menu.Items().Append(exitItem);
 	menu.Opened([](const auto& sender, const auto&) {
 		auto menuItems = sender.template as<MenuFlyout>().Items();
@@ -962,3 +986,108 @@ void RefreshDeviceList()
 		}
 	}
 }
+
+void ShowUpdateDialog()
+{
+	using namespace winrt::Windows::UI;
+	using namespace winrt::Windows::UI::Text;
+	using namespace winrt::Windows::UI::Xaml::Media;
+
+	StackPanel panel;
+	panel.Margin({ 16, 16, 16, 16 });
+	panel.MaxWidth(340);
+	panel.Spacing(8);
+
+	TextBlock title;
+	title.Text(_(L"A new version is available"));
+	title.FontSize(16);
+	title.FontWeight(FontWeights::SemiBold());
+	panel.Children().Append(title);
+
+	// Version line: "Version 1.2.0  (Current: 1.1)"
+	TextBlock versionLine;
+	versionLine.Text(std::wstring(_(L"Version")) + L" " + NormalizeVersionTag(g_pendingRelease.tagName) +
+		L"  (" + _(L"Current") + L": " + BTAUDIO_VERSION_WSTR + L")");
+	versionLine.FontSize(12);
+	versionLine.Foreground(SolidColorBrush(Colors::Gray()));
+	panel.Children().Append(versionLine);
+
+	// Release notes
+	if (!g_pendingRelease.body.empty())
+	{
+		TextBlock notesLabel;
+		notesLabel.Text(_(L"What's new:"));
+		notesLabel.FontSize(12);
+		notesLabel.FontWeight(FontWeights::SemiBold());
+		notesLabel.Margin({ 0, 8, 0, 0 });
+		panel.Children().Append(notesLabel);
+
+		TextBlock notes;
+		notes.Text(g_pendingRelease.body);
+		notes.FontSize(11);
+		notes.TextWrapping(TextWrapping::Wrap);
+		notes.MaxHeight(160);
+		panel.Children().Append(notes);
+	}
+
+	// Buttons
+	StackPanel buttonRow;
+	buttonRow.Orientation(Orientation::Horizontal);
+	buttonRow.HorizontalAlignment(HorizontalAlignment::Right);
+	buttonRow.Spacing(8);
+	buttonRow.Margin({ 0, 12, 0, 0 });
+
+	Button laterBtn;
+	laterBtn.Content(winrt::box_value(_(L"Later")));
+	laterBtn.Click([](const auto&, const auto&) {
+		g_updateFlyout.Hide();
+	});
+	buttonRow.Children().Append(laterBtn);
+
+	if (!g_pendingRelease.downloadUrl.empty())
+	{
+		Button updateBtn;
+		updateBtn.Content(winrt::box_value(_(L"Update Now")));
+		updateBtn.Click([](const auto&, const auto&) {
+			g_updateFlyout.Hide();
+			DownloadAndInstall(g_pendingRelease);
+		});
+		buttonRow.Children().Append(updateBtn);
+	}
+	else
+	{
+		// No matching architecture asset — fall back to browser.
+		Button openBtn;
+		openBtn.Content(winrt::box_value(_(L"Open Download Page")));
+		auto htmlUrl = g_pendingRelease.htmlUrl;
+		openBtn.Click([htmlUrl](const auto&, const auto&) {
+			winrt::Windows::System::Launcher::LaunchUriAsync(Uri(htmlUrl));
+			g_updateFlyout.Hide();
+		});
+		buttonRow.Children().Append(openBtn);
+	}
+
+	panel.Children().Append(buttonRow);
+
+	Flyout flyout;
+	flyout.ShouldConstrainToRootBounds(false);
+	flyout.Content(panel);
+	g_updateFlyout = flyout;
+
+	// Show near the tray icon (same pattern as the exit-confirmation flyout).
+	RECT iconRect;
+	auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
+	if (FAILED(hr))
+	{
+		LOG_HR(hr);
+		return;
+	}
+
+	auto dpi = GetDpiForWindow(g_hWnd);
+	g_xamlCanvas.Width(static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi));
+	g_xamlCanvas.Height(static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi));
+
+	SetWindowPos(g_hWnd, HWND_TOPMOST, iconRect.left, iconRect.top, 0, 0, SWP_HIDEWINDOW);
+	g_updateFlyout.ShowAt(g_xamlCanvas);
+}
+

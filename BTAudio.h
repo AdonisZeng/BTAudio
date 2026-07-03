@@ -14,6 +14,9 @@ namespace fs = std::filesystem;
 constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
 constexpr UINT WM_REFRESHDEVICELIST = WM_APP + 3;
+constexpr UINT WM_UPDATEAVAILABLE = WM_APP + 4;
+constexpr UINT WM_UPTODATE = WM_APP + 5;
+constexpr UINT WM_UPDATEFAILED = WM_APP + 6;
 
 HINSTANCE g_hInst;
 HWND g_hWnd;
@@ -54,7 +57,15 @@ StackPanel g_mainAvailableListPanel = nullptr;    // available devices
 TextBlock g_mainNoAvailableText = nullptr;
 Grid g_mainWindowRoot = nullptr;
 
+// Update checker
+Flyout g_updateFlyout = nullptr;
+
 #include "Util.hpp"
 #include "I18n.hpp"
 #include "SettingsUtil.hpp"
+#include "UpdateChecker.hpp"
+
+// Defined after UpdateChecker.hpp so ReleaseInfo is visible.
+ReleaseInfo g_pendingRelease;
+
 #include "Direct2DSvg.hpp"

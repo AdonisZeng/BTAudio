@@ -54,4 +54,10 @@
 #include <windows.ui.xaml.hosting.desktopwindowxamlsource.h>
 #include <winrt/Windows.UI.Xaml.Markup.h>
 
+// Update checker
+#include <winrt/Windows.Web.Http.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <sstream>
+#include <algorithm>
+
 #endif //PCH_H

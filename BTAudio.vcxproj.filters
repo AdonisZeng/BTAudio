@@ -36,6 +36,9 @@
     <ClInclude Include="Direct2DSvg.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="UpdateChecker.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="BTAudio.cpp">

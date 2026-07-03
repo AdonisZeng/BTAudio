@@ -344,6 +344,7 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="SettingsUtil.hpp" />
+    <ClInclude Include="UpdateChecker.hpp" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="Util.hpp" />
   </ItemGroup>

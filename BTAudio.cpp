@@ -4,8 +4,9 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
-winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
-void SetupDevicePicker();
+winrt::fire_and_forget ConnectDevice(DeviceInformation device);
+winrt::fire_and_forget ConnectDevice(std::wstring_view deviceId);
+void SetupDeviceWatcher();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
 void ApplyTheme();
@@ -74,7 +75,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	LoadSettings();
 	SetupFlyout();
 	SetupMenu();
-	SetupDevicePicker();
+	SetupDeviceWatcher();
 	SetupSvgIcon();
 	SetupMainWindow();
 
@@ -111,7 +112,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		for (const auto& connection : g_audioPlaybackConnections)
 		{
 			connection.second.second.Close();
-			g_devicePicker.SetDisplayStatus(connection.second.first, {}, DevicePickerDisplayStatusOptions::None);
 		}
 		if (g_reconnect)
 		{
@@ -173,7 +173,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 			for (const auto& i : g_lastDevices)
 			{
-				ConnectDevice(g_devicePicker, i);
+				ConnectDevice(i);
 			}
 			g_lastDevices.clear();
 		}
@@ -286,9 +286,14 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
+winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 {
-	picker.SetDisplayStatus(device, _(L"Connecting"), DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+	const std::wstring deviceId(device.Id());
+	const std::wstring deviceName(device.Name());
+
+	// Mark the device as "connecting" so the available list can show progress.
+	g_connectingDevices.emplace(deviceId, deviceName);
+	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 
 	bool success = false;
 	std::wstring errorMessage;
@@ -301,13 +306,13 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			// Avoid duplicate connections to the same device. emplace won't overwrite
 			// an existing key, which would create multiple AudioPlaybackConnection
 			// objects competing for the same Bluetooth link and cause audio stutter.
-			auto existing = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+			auto existing = g_audioPlaybackConnections.find(deviceId);
 			if (existing != g_audioPlaybackConnections.end())
 			{
 				existing->second.second.Close();
 				g_audioPlaybackConnections.erase(existing);
 			}
-			g_audioPlaybackConnections.emplace(device.Id(), std::pair(device, connection));
+			g_audioPlaybackConnections.emplace(deviceId, std::pair(device, connection));
 
 			connection.StateChanged([](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
@@ -315,9 +320,9 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 					auto it = g_audioPlaybackConnections.find(std::wstring(sender.DeviceId()));
 					if (it != g_audioPlaybackConnections.end())
 					{
-						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
 						g_audioPlaybackConnections.erase(it);
 					}
+					g_connectingDevices.erase(std::wstring(sender.DeviceId()));
 					PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 					// Do not call sender.Close() here. The connection is already in the
 					// Closed state and the map entry has been erased, so calling Close()
@@ -373,55 +378,54 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		LOG_CAUGHT_EXCEPTION();
 	}
 
-	if (success)
+	// Connecting phase is over regardless of outcome.
+	g_connectingDevices.erase(deviceId);
+
+	if (!success)
 	{
-		picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
-	}
-	else
-	{
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
+		auto it = g_audioPlaybackConnections.find(deviceId);
 		if (it != g_audioPlaybackConnections.end())
 		{
 			it->second.second.Close();
 			g_audioPlaybackConnections.erase(it);
 		}
-		picker.SetDisplayStatus(device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
+		// TODO: errorMessage is currently discarded. A future enhancement could
+		// surface it inline in the available-device card. For now we just refresh.
 	}
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
+winrt::fire_and_forget ConnectDevice(std::wstring_view deviceId)
 {
 	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
-	ConnectDevice(picker, device);
+	ConnectDevice(device);
 }
 
-void SetupDevicePicker()
+void SetupDeviceWatcher()
 {
-	g_devicePicker = DevicePicker();
-	winrt::check_hresult(g_devicePicker.as<IInitializeWithWindow>()->Initialize(g_hWnd));
+	// Use the A2DP sink device selector so the watcher surfaces exactly the
+	// devices that AudioPlaybackConnection can use.
+	auto selector = AudioPlaybackConnection::GetDeviceSelector();
+	g_deviceWatcher = DeviceInformation::CreateWatcher(selector);
 
-	g_devicePicker.Filter().SupportedDeviceSelectors().Append(AudioPlaybackConnection::GetDeviceSelector());
-	g_devicePicker.DevicePickerDismissed([](const auto&, const auto&) {
-		if (g_mainWindowVisible)
-			ShowMainWindow();
-		else
-			SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
-	});
-	g_devicePicker.DeviceSelected([](const auto& sender, const auto& args) {
-		ConnectDevice(sender, args.SelectedDevice());
-	});
-	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
-		auto device = args.Device();
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
-		if (it != g_audioPlaybackConnections.end())
-		{
-			it->second.second.Close();
-			g_audioPlaybackConnections.erase(it);
-		}
-		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
+	g_deviceWatcher.Added([](const auto&, const DeviceInformation& device) {
+		g_availableDevices.emplace(std::wstring(device.Id()), device);
 		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 	});
+	g_deviceWatcher.Updated([](const auto&, const DeviceInformationUpdate& update) {
+		auto it = g_availableDevices.find(std::wstring(update.Id()));
+		if (it != g_availableDevices.end())
+		{
+			it->second.Update(update);
+			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+		}
+	});
+	g_deviceWatcher.Removed([](const auto&, const DeviceInformationUpdate& update) {
+		if (g_availableDevices.erase(std::wstring(update.Id())) > 0)
+			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+	});
+
+	g_deviceWatcher.Start();
 }
 
 void SetupSvgIcon()
@@ -561,36 +565,31 @@ void SetupMainWindow()
 	scrollViewer.Content(g_mainDeviceListPanel);
 	scrollViewer.VerticalScrollBarVisibility(ScrollBarVisibility::Auto);
 
-	// Button: Connect New Device
-	Button connectButton;
-	connectButton.Content(winrt::box_value(_(L"Connect New Device")));
-	connectButton.Margin({ 12, 8, 12, 4 });
-	connectButton.HorizontalAlignment(HorizontalAlignment::Stretch);
-	connectButton.Click([](const auto&, const auto&) {
-		using namespace winrt::Windows::UI::Popups;
+	// Middle separator between connected and available sections
+	Border middleSeparator;
+	middleSeparator.Height(1);
+	middleSeparator.Background(SolidColorBrush(Colors::LightGray()));
+	middleSeparator.Margin({ 0, 8, 0, 0 });
 
-		RECT iconRect;
-		auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
-		if (FAILED(hr))
-		{
-			LOG_HR(hr);
-			return;
-		}
+	// Available device section header
+	TextBlock availableHeader;
+	availableHeader.Text(_(L"Available Devices"));
+	availableHeader.FontSize(14);
+	availableHeader.FontWeight(FontWeights::SemiBold());
+	availableHeader.Margin({ 12, 8, 12, 8 });
 
-		auto dpi = GetDpiForWindow(g_hWnd);
-		Rect rect = {
-			static_cast<float>(iconRect.left * USER_DEFAULT_SCREEN_DPI / dpi),
-			static_cast<float>(iconRect.top * USER_DEFAULT_SCREEN_DPI / dpi),
-			static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi),
-			static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi)
-		};
+	// Available device list panel (inside its own ScrollViewer)
+	g_mainAvailableListPanel = StackPanel();
 
-		// Hide window without changing g_mainWindowVisible so it re-shows after picker dismisses
-		SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
-		SetLayeredWindowAttributes(g_hWnd, 0, 0, LWA_ALPHA);
-		SetForegroundWindow(g_hWnd);
-		g_devicePicker.Show(rect, Placement::Above);
-	});
+	g_mainNoAvailableText = TextBlock();
+	g_mainNoAvailableText.Text(_(L"No devices available"));
+	g_mainNoAvailableText.Foreground(SolidColorBrush(Colors::Gray()));
+	g_mainNoAvailableText.HorizontalAlignment(HorizontalAlignment::Center);
+	g_mainNoAvailableText.Margin({ 0, 12, 0, 12 });
+
+	ScrollViewer availableScrollViewer;
+	availableScrollViewer.Content(g_mainAvailableListPanel);
+	availableScrollViewer.VerticalScrollBarVisibility(ScrollBarVisibility::Auto);
 
 	// Separator
 	Border bottomSeparator;
@@ -639,30 +638,36 @@ void SetupMainWindow()
 		g_xamlFlyout.ShowAt(g_xamlCanvas);
 	});
 
-	// Main layout (Grid so the device list fills remaining space)
+	// Main layout (Grid so both device lists share the remaining vertical space)
 	g_mainWindowRoot = Grid();
 	RowDefinition rowTitle;
 	rowTitle.Height(GridLength(36, GridUnitType::Pixel));
 	RowDefinition rowSep1;
 	rowSep1.Height(GridLength(1, GridUnitType::Pixel));
-	RowDefinition rowHeader;
-	rowHeader.Height(GridLength(1, GridUnitType::Auto));
-	RowDefinition rowList;
-	rowList.Height(GridLength(1, GridUnitType::Star));
-	RowDefinition rowConnect;
-	rowConnect.Height(GridLength(1, GridUnitType::Auto));
-	RowDefinition rowSep2;
-	rowSep2.Height(GridLength(1, GridUnitType::Pixel));
+	RowDefinition rowConnHeader;
+	rowConnHeader.Height(GridLength(1, GridUnitType::Auto));
+	RowDefinition rowConnList;
+	rowConnList.Height(GridLength(1, GridUnitType::Star));
+	RowDefinition rowMidSep;
+	rowMidSep.Height(GridLength(1, GridUnitType::Pixel));
+	RowDefinition rowAvailHeader;
+	rowAvailHeader.Height(GridLength(1, GridUnitType::Auto));
+	RowDefinition rowAvailList;
+	rowAvailList.Height(GridLength(1, GridUnitType::Star));
+	RowDefinition rowBotSep;
+	rowBotSep.Height(GridLength(1, GridUnitType::Pixel));
 	RowDefinition rowSettings;
 	rowSettings.Height(GridLength(1, GridUnitType::Auto));
 	RowDefinition rowExit;
 	rowExit.Height(GridLength(1, GridUnitType::Auto));
 	g_mainWindowRoot.RowDefinitions().Append(rowTitle);
 	g_mainWindowRoot.RowDefinitions().Append(rowSep1);
-	g_mainWindowRoot.RowDefinitions().Append(rowHeader);
-	g_mainWindowRoot.RowDefinitions().Append(rowList);
-	g_mainWindowRoot.RowDefinitions().Append(rowConnect);
-	g_mainWindowRoot.RowDefinitions().Append(rowSep2);
+	g_mainWindowRoot.RowDefinitions().Append(rowConnHeader);
+	g_mainWindowRoot.RowDefinitions().Append(rowConnList);
+	g_mainWindowRoot.RowDefinitions().Append(rowMidSep);
+	g_mainWindowRoot.RowDefinitions().Append(rowAvailHeader);
+	g_mainWindowRoot.RowDefinitions().Append(rowAvailList);
+	g_mainWindowRoot.RowDefinitions().Append(rowBotSep);
 	g_mainWindowRoot.RowDefinitions().Append(rowSettings);
 	g_mainWindowRoot.RowDefinitions().Append(rowExit);
 
@@ -670,7 +675,9 @@ void SetupMainWindow()
 	g_mainWindowRoot.Children().Append(titleSeparator);
 	g_mainWindowRoot.Children().Append(deviceHeader);
 	g_mainWindowRoot.Children().Append(scrollViewer);
-	g_mainWindowRoot.Children().Append(connectButton);
+	g_mainWindowRoot.Children().Append(middleSeparator);
+	g_mainWindowRoot.Children().Append(availableHeader);
+	g_mainWindowRoot.Children().Append(availableScrollViewer);
 	g_mainWindowRoot.Children().Append(bottomSeparator);
 	g_mainWindowRoot.Children().Append(settingsButton);
 	g_mainWindowRoot.Children().Append(exitButton);
@@ -679,10 +686,12 @@ void SetupMainWindow()
 	Grid::SetRow(titleSeparator, 1);
 	Grid::SetRow(deviceHeader, 2);
 	Grid::SetRow(scrollViewer, 3);
-	Grid::SetRow(connectButton, 4);
-	Grid::SetRow(bottomSeparator, 5);
-	Grid::SetRow(settingsButton, 6);
-	Grid::SetRow(exitButton, 7);
+	Grid::SetRow(middleSeparator, 4);
+	Grid::SetRow(availableHeader, 5);
+	Grid::SetRow(availableScrollViewer, 6);
+	Grid::SetRow(bottomSeparator, 7);
+	Grid::SetRow(settingsButton, 8);
+	Grid::SetRow(exitButton, 9);
 
 	g_xamlCanvas.Children().Append(g_mainWindowRoot);
 }
@@ -747,85 +756,203 @@ void HideMainWindow()
 
 void RefreshDeviceList()
 {
-	if (!g_mainDeviceListPanel)
-		return;
-
-	g_mainDeviceListPanel.Children().Clear();
-
-	if (g_audioPlaybackConnections.empty())
-	{
-		g_mainDeviceListPanel.Children().Append(g_mainNoDeviceText);
-		return;
-	}
-
 	using namespace winrt::Windows::UI;
 	using namespace winrt::Windows::UI::Xaml::Media;
 
-	for (const auto& [id, pair] : g_audioPlaybackConnections)
+	// ---- Connected devices ----
+	if (g_mainDeviceListPanel)
 	{
-		const auto& device = pair.first;
+		g_mainDeviceListPanel.Children().Clear();
 
-		TextBlock nameText;
-		nameText.Text(device.Name());
-		nameText.FontSize(13);
-		nameText.VerticalAlignment(VerticalAlignment::Center);
-		nameText.TextTrimming(TextTrimming::CharacterEllipsis);
-
-		TextBlock statusText;
-		statusText.Text(_(L"Connected"));
-		statusText.FontSize(11);
-		statusText.Foreground(SolidColorBrush(Colors::Green()));
-		statusText.VerticalAlignment(VerticalAlignment::Center);
-		statusText.Margin({ 8, 0, 0, 0 });
-
-		Button disconnectButton;
-		disconnectButton.Content(winrt::box_value(L"\xE8BB"));
-		disconnectButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
-		disconnectButton.FontSize(10);
-		disconnectButton.Width(28);
-		disconnectButton.Height(28);
-		disconnectButton.Background(SolidColorBrush(Colors::Transparent()));
-		disconnectButton.Foreground(SolidColorBrush(Colors::Gray()));
-		disconnectButton.HorizontalAlignment(HorizontalAlignment::Right);
-		disconnectButton.VerticalAlignment(VerticalAlignment::Center);
-
-		std::wstring deviceId(id);
-		disconnectButton.Click([deviceId](const auto&, const auto&) {
-			auto it = g_audioPlaybackConnections.find(deviceId);
-			if (it != g_audioPlaybackConnections.end())
+		if (g_audioPlaybackConnections.empty())
+		{
+			g_mainDeviceListPanel.Children().Append(g_mainNoDeviceText);
+		}
+		else
+		{
+			for (const auto& [id, pair] : g_audioPlaybackConnections)
 			{
-				g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
-				it->second.second.Close();
-				g_audioPlaybackConnections.erase(it);
-				PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+				const auto& device = pair.first;
+
+				TextBlock nameText;
+				nameText.Text(device.Name());
+				nameText.FontSize(13);
+				nameText.VerticalAlignment(VerticalAlignment::Center);
+				nameText.TextTrimming(TextTrimming::CharacterEllipsis);
+
+				TextBlock statusText;
+				statusText.Text(_(L"Connected"));
+				statusText.FontSize(11);
+				statusText.Foreground(SolidColorBrush(Colors::Green()));
+				statusText.VerticalAlignment(VerticalAlignment::Center);
+				statusText.Margin({ 8, 0, 0, 0 });
+
+				Button disconnectButton;
+				disconnectButton.Content(winrt::box_value(L"\xE8BB"));
+				disconnectButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+				disconnectButton.FontSize(10);
+				disconnectButton.Width(28);
+				disconnectButton.Height(28);
+				disconnectButton.Background(SolidColorBrush(Colors::Transparent()));
+				disconnectButton.Foreground(SolidColorBrush(Colors::Gray()));
+				disconnectButton.HorizontalAlignment(HorizontalAlignment::Right);
+				disconnectButton.VerticalAlignment(VerticalAlignment::Center);
+
+				std::wstring deviceId(id);
+				disconnectButton.Click([deviceId](const auto&, const auto&) {
+					auto it = g_audioPlaybackConnections.find(deviceId);
+					if (it != g_audioPlaybackConnections.end())
+					{
+						it->second.second.Close();
+						g_audioPlaybackConnections.erase(it);
+						PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+					}
+				});
+
+				Grid deviceGrid;
+				ColumnDefinition deviceCol0;
+				deviceCol0.Width(GridLength(1, GridUnitType::Star));
+				ColumnDefinition deviceCol1;
+				deviceCol1.Width(GridLength(1, GridUnitType::Auto));
+				ColumnDefinition deviceCol2;
+				deviceCol2.Width(GridLength(1, GridUnitType::Auto));
+				deviceGrid.ColumnDefinitions().Append(deviceCol0);
+				deviceGrid.ColumnDefinitions().Append(deviceCol1);
+				deviceGrid.ColumnDefinitions().Append(deviceCol2);
+				deviceGrid.Children().Append(nameText);
+				deviceGrid.Children().Append(statusText);
+				deviceGrid.Children().Append(disconnectButton);
+				Grid::SetColumn(nameText, 0);
+				Grid::SetColumn(statusText, 1);
+				Grid::SetColumn(disconnectButton, 2);
+
+				Border deviceCard;
+				deviceCard.Child(deviceGrid);
+				deviceCard.Margin({ 12, 2, 12, 2 });
+				deviceCard.Padding({ 8, 8, 8, 8 });
+				deviceCard.CornerRadius(CornerRadius(4));
+				deviceCard.BorderThickness(Thickness(1));
+				deviceCard.BorderBrush(SolidColorBrush(Colors::LightGray()));
+
+				g_mainDeviceListPanel.Children().Append(deviceCard);
 			}
-		});
+		}
+	}
 
-		Grid deviceGrid;
-		ColumnDefinition deviceCol0;
-		deviceCol0.Width(GridLength(1, GridUnitType::Star));
-		ColumnDefinition deviceCol1;
-		deviceCol1.Width(GridLength(1, GridUnitType::Auto));
-		ColumnDefinition deviceCol2;
-		deviceCol2.Width(GridLength(1, GridUnitType::Auto));
-		deviceGrid.ColumnDefinitions().Append(deviceCol0);
-		deviceGrid.ColumnDefinitions().Append(deviceCol1);
-		deviceGrid.ColumnDefinitions().Append(deviceCol2);
-		deviceGrid.Children().Append(nameText);
-		deviceGrid.Children().Append(statusText);
-		deviceGrid.Children().Append(disconnectButton);
-		Grid::SetColumn(nameText, 0);
-		Grid::SetColumn(statusText, 1);
-		Grid::SetColumn(disconnectButton, 2);
+	// ---- Available devices ----
+	if (g_mainAvailableListPanel)
+	{
+		g_mainAvailableListPanel.Children().Clear();
 
-		Border deviceCard;
-		deviceCard.Child(deviceGrid);
-		deviceCard.Margin({ 12, 2, 12, 2 });
-		deviceCard.Padding({ 8, 8, 8, 8 });
-		deviceCard.CornerRadius(CornerRadius(4));
-		deviceCard.BorderThickness(Thickness(1));
-		deviceCard.BorderBrush(SolidColorBrush(Colors::LightGray()));
+		// Only show devices that are neither already connected nor currently connecting.
+		bool any = false;
+		for (const auto& [id, device] : g_availableDevices)
+		{
+			if (g_audioPlaybackConnections.find(id) != g_audioPlaybackConnections.end())
+				continue;
+			if (g_connectingDevices.find(id) != g_connectingDevices.end())
+				continue;
 
-		g_mainDeviceListPanel.Children().Append(deviceCard);
+			any = true;
+
+			TextBlock nameText;
+			nameText.Text(device.Name());
+			nameText.FontSize(13);
+			nameText.VerticalAlignment(VerticalAlignment::Center);
+			nameText.TextTrimming(TextTrimming::CharacterEllipsis);
+
+			Button connectButton;
+			connectButton.Content(winrt::box_value(_(L"Connect")));
+			connectButton.FontSize(11);
+			connectButton.Width(72);
+			connectButton.Height(28);
+			connectButton.HorizontalAlignment(HorizontalAlignment::Right);
+			connectButton.VerticalAlignment(VerticalAlignment::Center);
+
+			std::wstring deviceId(id);
+			connectButton.Click([deviceId](const auto&, const auto&) {
+				ConnectDevice(deviceId);
+			});
+
+			Grid availGrid;
+			ColumnDefinition availCol0;
+			availCol0.Width(GridLength(1, GridUnitType::Star));
+			ColumnDefinition availCol1;
+			availCol1.Width(GridLength(1, GridUnitType::Auto));
+			availGrid.ColumnDefinitions().Append(availCol0);
+			availGrid.ColumnDefinitions().Append(availCol1);
+			availGrid.Children().Append(nameText);
+			availGrid.Children().Append(connectButton);
+			Grid::SetColumn(nameText, 0);
+			Grid::SetColumn(connectButton, 1);
+
+			Border availCard;
+			availCard.Child(availGrid);
+			availCard.Margin({ 12, 2, 12, 2 });
+			availCard.Padding({ 8, 8, 8, 8 });
+			availCard.CornerRadius(CornerRadius(4));
+			availCard.BorderThickness(Thickness(1));
+			availCard.BorderBrush(SolidColorBrush(Colors::LightGray()));
+
+			g_mainAvailableListPanel.Children().Append(availCard);
+		}
+
+		// Devices currently connecting are shown with a "Connecting" status and disabled button.
+		for (const auto& [id, name] : g_connectingDevices)
+		{
+			any = true;
+
+			TextBlock nameText;
+			nameText.Text(name);
+			nameText.FontSize(13);
+			nameText.VerticalAlignment(VerticalAlignment::Center);
+			nameText.TextTrimming(TextTrimming::CharacterEllipsis);
+
+			TextBlock statusText;
+			statusText.Text(_(L"Connecting"));
+			statusText.FontSize(11);
+			statusText.Foreground(SolidColorBrush(Colors::Gray()));
+			statusText.VerticalAlignment(VerticalAlignment::Center);
+			statusText.Margin({ 8, 0, 0, 0 });
+
+			ProgressRing ring;
+			ring.IsActive(true);
+			ring.Width(20);
+			ring.Height(20);
+			ring.HorizontalAlignment(HorizontalAlignment::Right);
+			ring.VerticalAlignment(VerticalAlignment::Center);
+
+			Grid availGrid;
+			ColumnDefinition availCol0;
+			availCol0.Width(GridLength(1, GridUnitType::Star));
+			ColumnDefinition availCol1;
+			availCol1.Width(GridLength(1, GridUnitType::Auto));
+			ColumnDefinition availCol2;
+			availCol2.Width(GridLength(1, GridUnitType::Auto));
+			availGrid.ColumnDefinitions().Append(availCol0);
+			availGrid.ColumnDefinitions().Append(availCol1);
+			availGrid.ColumnDefinitions().Append(availCol2);
+			availGrid.Children().Append(nameText);
+			availGrid.Children().Append(statusText);
+			availGrid.Children().Append(ring);
+			Grid::SetColumn(nameText, 0);
+			Grid::SetColumn(statusText, 1);
+			Grid::SetColumn(ring, 2);
+
+			Border availCard;
+			availCard.Child(availGrid);
+			availCard.Margin({ 12, 2, 12, 2 });
+			availCard.Padding({ 8, 8, 8, 8 });
+			availCard.CornerRadius(CornerRadius(4));
+			availCard.BorderThickness(Thickness(1));
+			availCard.BorderBrush(SolidColorBrush(Colors::LightGray()));
+
+			g_mainAvailableListPanel.Children().Append(availCard);
+		}
+
+		if (!any)
+		{
+			g_mainAvailableListPanel.Children().Append(g_mainNoAvailableText);
+		}
 	}
 }

@@ -1,0 +1,14 @@
+feat: replace system DevicePicker with in-app device browser
+
+Remove the Windows DevicePicker popup and integrate a self-contained
+device discovery UI directly into the main window using DeviceWatcher.
+
+- Replace DevicePicker + Shell_NotifyIconGetRect dance with a
+  DeviceWatcher that continuously discovers Bluetooth A2DP sink devices
+- Drop the "Connect New Device" button; add an "Available Devices"
+  section with per-device "Connect" buttons
+- Show "Connecting" state (ProgressRing + status text) while a device
+  handshake is in progress
+- Refresh both the connected and available device lists from a single
+  RefreshDeviceList() call dispatched via WM_REFRESHDEVICELIST
+- Remove all DevicePicker-related globals, includes, and event handlers

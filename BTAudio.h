@@ -22,7 +22,14 @@ Canvas g_xamlCanvas = nullptr;
 Flyout g_xamlFlyout = nullptr;
 MenuFlyout g_xamlMenu = nullptr;
 FocusState g_menuFocusState = FocusState::Unfocused;
-DevicePicker g_devicePicker = nullptr;
+DeviceWatcher g_deviceWatcher = nullptr;
+// Available (pairable) bluetooth audio devices discovered by DeviceWatcher.
+// Keyed by device id so add/update/remove from the watcher is O(1).
+std::map<std::wstring, DeviceInformation> g_availableDevices;
+// Devices currently being connected. Key = device id, value = device name.
+// Used to render a "Connecting..." status in the available list.
+std::unordered_map<std::wstring, std::wstring> g_connectingDevices;
+// id -> (DeviceInformation, AudioPlaybackConnection)
 std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConnection>> g_audioPlaybackConnections;
 HICON g_hIconLight = nullptr;
 HICON g_hIconDark = nullptr;
@@ -41,8 +48,10 @@ std::vector<std::wstring> g_lastDevices;
 
 // Main window
 bool g_mainWindowVisible = false;
-StackPanel g_mainDeviceListPanel = nullptr;
+StackPanel g_mainDeviceListPanel = nullptr;       // connected devices
 TextBlock g_mainNoDeviceText = nullptr;
+StackPanel g_mainAvailableListPanel = nullptr;    // available devices
+TextBlock g_mainNoAvailableText = nullptr;
 Grid g_mainWindowRoot = nullptr;
 
 #include "Util.hpp"

@@ -9,6 +9,10 @@ void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
 void ApplyTheme();
+void SetupMainWindow();
+void ShowMainWindow();
+void HideMainWindow();
+void RefreshDeviceList();
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -72,6 +76,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	SetupMenu();
 	SetupDevicePicker();
 	SetupSvgIcon();
+	SetupMainWindow();
 
 	g_nid.hWnd = g_niid.hWnd = g_hWnd;
 	wcscpy_s(g_nid.szTip, _(L"BTAudio"));
@@ -133,30 +138,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 		case NIN_SELECT:
 		case NIN_KEYSELECT:
-		{
-			using namespace winrt::Windows::UI::Popups;
-
-			RECT iconRect;
-			auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
-			if (FAILED(hr))
-			{
-				LOG_HR(hr);
-				break;
-			}
-
-			auto dpi = GetDpiForWindow(hWnd);
-			Rect rect = {
-				static_cast<float>(iconRect.left * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>(iconRect.top * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi)
-			};
-
-			SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), SWP_HIDEWINDOW);
-			SetForegroundWindow(hWnd);
-			g_devicePicker.Show(rect, Placement::Above);
-		}
-		break;
+			if (g_mainWindowVisible)
+				HideMainWindow();
+			else
+				ShowMainWindow();
+			break;
 		case WM_RBUTTONUP: // Menu activated by mouse click
 			g_menuFocusState = FocusState::Pointer;
 			break;
@@ -164,6 +150,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 			if (g_menuFocusState == FocusState::Unfocused)
 				g_menuFocusState = FocusState::Keyboard;
+
+			g_mainWindowVisible = false;
 
 			auto dpi = GetDpiForWindow(hWnd);
 			Point point = {
@@ -189,6 +177,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 			g_lastDevices.clear();
 		}
+		break;
+	case WM_REFRESHDEVICELIST:
+		RefreshDeviceList();
 		break;
 	default:
 		if (WM_TASKBAR_CREATED && message == WM_TASKBAR_CREATED)
@@ -252,9 +243,12 @@ void SetupMenu()
 	exitItem.Click([](const auto&, const auto&) {
 		if (g_audioPlaybackConnections.size() == 0)
 		{
+			g_mainWindowVisible = false;
 			PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
 			return;
 		}
+
+		g_mainWindowVisible = false;
 
 		RECT iconRect;
 		auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
@@ -324,6 +318,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 						g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
 						g_audioPlaybackConnections.erase(it);
 					}
+					PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 					// Do not call sender.Close() here. The connection is already in the
 					// Closed state and the map entry has been erased, so calling Close()
 					// again is redundant and risks reentrancy within the event callback.
@@ -392,6 +387,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 		}
 		picker.SetDisplayStatus(device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
 	}
+	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 }
 
 winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
@@ -407,7 +403,10 @@ void SetupDevicePicker()
 
 	g_devicePicker.Filter().SupportedDeviceSelectors().Append(AudioPlaybackConnection::GetDeviceSelector());
 	g_devicePicker.DevicePickerDismissed([](const auto&, const auto&) {
-		SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+		if (g_mainWindowVisible)
+			ShowMainWindow();
+		else
+			SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
 	});
 	g_devicePicker.DeviceSelected([](const auto& sender, const auto& args) {
 		ConnectDevice(sender, args.SelectedDevice());
@@ -421,6 +420,7 @@ void SetupDevicePicker()
 			g_audioPlaybackConnections.erase(it);
 		}
 		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
+		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 	});
 }
 
@@ -472,6 +472,9 @@ void ApplyTheme()
 				fe.RequestedTheme(theme);
 		}
 	}
+
+	if (g_mainWindowRoot)
+		g_mainWindowRoot.RequestedTheme(theme);
 }
 
 void UpdateNotifyIcon()
@@ -488,5 +491,341 @@ void UpdateNotifyIcon()
 		{
 			LOG_LAST_ERROR();
 		}
+	}
+}
+
+void SetupMainWindow()
+{
+	using namespace winrt::Windows::UI;
+	using namespace winrt::Windows::UI::Text;
+	using namespace winrt::Windows::UI::Xaml::Media;
+
+	// Title bar
+	TextBlock titleText;
+	titleText.Text(L"BTAudio");
+	titleText.FontSize(18);
+	titleText.FontWeight(FontWeights::SemiBold());
+	titleText.VerticalAlignment(VerticalAlignment::Center);
+	titleText.Margin({ 12, 0, 0, 0 });
+
+	Button closeButton;
+	closeButton.Content(winrt::box_value(L"\xE8BB"));
+	closeButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+	closeButton.FontSize(12);
+	closeButton.Width(40);
+	closeButton.Height(32);
+	closeButton.Background(SolidColorBrush(Colors::Transparent()));
+	closeButton.Foreground(SolidColorBrush(Colors::Gray()));
+	closeButton.HorizontalAlignment(HorizontalAlignment::Right);
+	closeButton.Click([](const auto&, const auto&) {
+		HideMainWindow();
+	});
+
+	Grid titleBar;
+	titleBar.Height(36);
+	ColumnDefinition titleBarCol0;
+	titleBarCol0.Width(GridLength(1, GridUnitType::Star));
+	ColumnDefinition titleBarCol1;
+	titleBarCol1.Width(GridLength(40, GridUnitType::Pixel));
+	titleBar.ColumnDefinitions().Append(titleBarCol0);
+	titleBar.ColumnDefinitions().Append(titleBarCol1);
+	titleBar.SetValue(Canvas::ZIndexProperty(), winrt::box_value(1));
+
+	titleBar.Children().Append(titleText);
+	titleBar.Children().Append(closeButton);
+	Grid::SetColumn(titleText, 0);
+	Grid::SetColumn(closeButton, 1);
+
+	// Separator
+	Border titleSeparator;
+	titleSeparator.Height(1);
+	titleSeparator.Background(SolidColorBrush(Colors::LightGray()));
+
+	// Device section header
+	TextBlock deviceHeader;
+	deviceHeader.Text(_(L"Connected Devices"));
+	deviceHeader.FontSize(14);
+	deviceHeader.FontWeight(FontWeights::SemiBold());
+	deviceHeader.Margin({ 12, 12, 12, 8 });
+
+	// Device list panel (inside ScrollViewer)
+	g_mainDeviceListPanel = StackPanel();
+
+	g_mainNoDeviceText = TextBlock();
+	g_mainNoDeviceText.Text(_(L"No devices connected"));
+	g_mainNoDeviceText.Foreground(SolidColorBrush(Colors::Gray()));
+	g_mainNoDeviceText.HorizontalAlignment(HorizontalAlignment::Center);
+	g_mainNoDeviceText.Margin({ 0, 20, 0, 20 });
+
+	ScrollViewer scrollViewer;
+	scrollViewer.Content(g_mainDeviceListPanel);
+	scrollViewer.VerticalScrollBarVisibility(ScrollBarVisibility::Auto);
+
+	// Button: Connect New Device
+	Button connectButton;
+	connectButton.Content(winrt::box_value(_(L"Connect New Device")));
+	connectButton.Margin({ 12, 8, 12, 4 });
+	connectButton.HorizontalAlignment(HorizontalAlignment::Stretch);
+	connectButton.Click([](const auto&, const auto&) {
+		using namespace winrt::Windows::UI::Popups;
+
+		RECT iconRect;
+		auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
+		if (FAILED(hr))
+		{
+			LOG_HR(hr);
+			return;
+		}
+
+		auto dpi = GetDpiForWindow(g_hWnd);
+		Rect rect = {
+			static_cast<float>(iconRect.left * USER_DEFAULT_SCREEN_DPI / dpi),
+			static_cast<float>(iconRect.top * USER_DEFAULT_SCREEN_DPI / dpi),
+			static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi),
+			static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi)
+		};
+
+		// Hide window without changing g_mainWindowVisible so it re-shows after picker dismisses
+		SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+		SetLayeredWindowAttributes(g_hWnd, 0, 0, LWA_ALPHA);
+		SetForegroundWindow(g_hWnd);
+		g_devicePicker.Show(rect, Placement::Above);
+	});
+
+	// Separator
+	Border bottomSeparator;
+	bottomSeparator.Height(1);
+	bottomSeparator.Background(SolidColorBrush(Colors::LightGray()));
+	bottomSeparator.Margin({ 0, 8, 0, 4 });
+
+	// Button: Bluetooth Settings
+	Button settingsButton;
+	settingsButton.Content(winrt::box_value(_(L"Bluetooth Settings")));
+	settingsButton.Margin({ 12, 4, 12, 2 });
+	settingsButton.HorizontalAlignment(HorizontalAlignment::Stretch);
+	settingsButton.Click([](const auto&, const auto&) {
+		winrt::Windows::System::Launcher::LaunchUriAsync(Uri(L"ms-settings:bluetooth"));
+	});
+
+	// Button: Exit
+	Button exitButton;
+	exitButton.Content(winrt::box_value(_(L"Exit")));
+	exitButton.Margin({ 12, 2, 12, 8 });
+	exitButton.HorizontalAlignment(HorizontalAlignment::Stretch);
+	exitButton.Click([](const auto&, const auto&) {
+		if (g_audioPlaybackConnections.size() == 0)
+		{
+			HideMainWindow();
+			PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
+			return;
+		}
+
+		HideMainWindow();
+
+		RECT iconRect;
+		auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
+		if (FAILED(hr))
+		{
+			LOG_HR(hr);
+			return;
+		}
+
+		auto dpi = GetDpiForWindow(g_hWnd);
+
+		SetWindowPos(g_hWnd, HWND_TOPMOST, iconRect.left, iconRect.top, 0, 0, SWP_HIDEWINDOW);
+		g_xamlCanvas.Width(static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi));
+		g_xamlCanvas.Height(static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi));
+
+		g_xamlFlyout.ShowAt(g_xamlCanvas);
+	});
+
+	// Main layout (Grid so the device list fills remaining space)
+	g_mainWindowRoot = Grid();
+	RowDefinition rowTitle;
+	rowTitle.Height(GridLength(36, GridUnitType::Pixel));
+	RowDefinition rowSep1;
+	rowSep1.Height(GridLength(1, GridUnitType::Pixel));
+	RowDefinition rowHeader;
+	rowHeader.Height(GridLength(1, GridUnitType::Auto));
+	RowDefinition rowList;
+	rowList.Height(GridLength(1, GridUnitType::Star));
+	RowDefinition rowConnect;
+	rowConnect.Height(GridLength(1, GridUnitType::Auto));
+	RowDefinition rowSep2;
+	rowSep2.Height(GridLength(1, GridUnitType::Pixel));
+	RowDefinition rowSettings;
+	rowSettings.Height(GridLength(1, GridUnitType::Auto));
+	RowDefinition rowExit;
+	rowExit.Height(GridLength(1, GridUnitType::Auto));
+	g_mainWindowRoot.RowDefinitions().Append(rowTitle);
+	g_mainWindowRoot.RowDefinitions().Append(rowSep1);
+	g_mainWindowRoot.RowDefinitions().Append(rowHeader);
+	g_mainWindowRoot.RowDefinitions().Append(rowList);
+	g_mainWindowRoot.RowDefinitions().Append(rowConnect);
+	g_mainWindowRoot.RowDefinitions().Append(rowSep2);
+	g_mainWindowRoot.RowDefinitions().Append(rowSettings);
+	g_mainWindowRoot.RowDefinitions().Append(rowExit);
+
+	g_mainWindowRoot.Children().Append(titleBar);
+	g_mainWindowRoot.Children().Append(titleSeparator);
+	g_mainWindowRoot.Children().Append(deviceHeader);
+	g_mainWindowRoot.Children().Append(scrollViewer);
+	g_mainWindowRoot.Children().Append(connectButton);
+	g_mainWindowRoot.Children().Append(bottomSeparator);
+	g_mainWindowRoot.Children().Append(settingsButton);
+	g_mainWindowRoot.Children().Append(exitButton);
+
+	Grid::SetRow(titleBar, 0);
+	Grid::SetRow(titleSeparator, 1);
+	Grid::SetRow(deviceHeader, 2);
+	Grid::SetRow(scrollViewer, 3);
+	Grid::SetRow(connectButton, 4);
+	Grid::SetRow(bottomSeparator, 5);
+	Grid::SetRow(settingsButton, 6);
+	Grid::SetRow(exitButton, 7);
+
+	g_xamlCanvas.Children().Append(g_mainWindowRoot);
+}
+
+void ShowMainWindow()
+{
+	const float windowWidth = 380.0f;
+	const float windowHeight = 480.0f;
+	auto dpi = GetDpiForWindow(g_hWnd);
+	auto scale = static_cast<float>(dpi) / USER_DEFAULT_SCREEN_DPI;
+	auto scaledWidth = static_cast<int>(windowWidth * scale);
+	auto scaledHeight = static_cast<int>(windowHeight * scale);
+
+	// Center on the primary work area
+	RECT workArea;
+	SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+	int x = (workArea.left + workArea.right - scaledWidth) / 2;
+	int y = (workArea.top + workArea.bottom - scaledHeight) / 2;
+
+	// Ensure window is on screen
+	if (x < workArea.left)
+		x = workArea.left;
+	if (y < workArea.top)
+		y = workArea.top;
+	if (x + scaledWidth > workArea.right)
+		x = workArea.right - scaledWidth;
+	if (y + scaledHeight > workArea.bottom)
+		y = workArea.bottom - scaledHeight;
+
+	RefreshDeviceList();
+
+	g_xamlCanvas.Width(windowWidth);
+	g_xamlCanvas.Height(windowHeight);
+	if (g_mainWindowRoot)
+	{
+		g_mainWindowRoot.Width(windowWidth);
+		g_mainWindowRoot.Height(windowHeight);
+	}
+
+	SetLayeredWindowAttributes(g_hWnd, 0, 255, LWA_ALPHA);
+	SetWindowPos(g_hWnd, HWND_TOPMOST, x, y, scaledWidth, scaledHeight, SWP_SHOWWINDOW);
+	SetWindowPos(g_hWndXaml, nullptr, 0, 0, scaledWidth, scaledHeight, SWP_NOZORDER | SWP_SHOWWINDOW);
+	SetForegroundWindow(g_hWnd);
+
+	g_mainWindowVisible = true;
+}
+
+void HideMainWindow()
+{
+	g_mainWindowVisible = false;
+	SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+	SetWindowPos(g_hWndXaml, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+	SetLayeredWindowAttributes(g_hWnd, 0, 0, LWA_ALPHA);
+	g_xamlCanvas.Width(0);
+	g_xamlCanvas.Height(0);
+	if (g_mainWindowRoot)
+	{
+		g_mainWindowRoot.Width(0);
+		g_mainWindowRoot.Height(0);
+	}
+}
+
+void RefreshDeviceList()
+{
+	if (!g_mainDeviceListPanel)
+		return;
+
+	g_mainDeviceListPanel.Children().Clear();
+
+	if (g_audioPlaybackConnections.empty())
+	{
+		g_mainDeviceListPanel.Children().Append(g_mainNoDeviceText);
+		return;
+	}
+
+	using namespace winrt::Windows::UI;
+	using namespace winrt::Windows::UI::Xaml::Media;
+
+	for (const auto& [id, pair] : g_audioPlaybackConnections)
+	{
+		const auto& device = pair.first;
+
+		TextBlock nameText;
+		nameText.Text(device.Name());
+		nameText.FontSize(13);
+		nameText.VerticalAlignment(VerticalAlignment::Center);
+		nameText.TextTrimming(TextTrimming::CharacterEllipsis);
+
+		TextBlock statusText;
+		statusText.Text(_(L"Connected"));
+		statusText.FontSize(11);
+		statusText.Foreground(SolidColorBrush(Colors::Green()));
+		statusText.VerticalAlignment(VerticalAlignment::Center);
+		statusText.Margin({ 8, 0, 0, 0 });
+
+		Button disconnectButton;
+		disconnectButton.Content(winrt::box_value(L"\xE8BB"));
+		disconnectButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+		disconnectButton.FontSize(10);
+		disconnectButton.Width(28);
+		disconnectButton.Height(28);
+		disconnectButton.Background(SolidColorBrush(Colors::Transparent()));
+		disconnectButton.Foreground(SolidColorBrush(Colors::Gray()));
+		disconnectButton.HorizontalAlignment(HorizontalAlignment::Right);
+		disconnectButton.VerticalAlignment(VerticalAlignment::Center);
+
+		std::wstring deviceId(id);
+		disconnectButton.Click([deviceId](const auto&, const auto&) {
+			auto it = g_audioPlaybackConnections.find(deviceId);
+			if (it != g_audioPlaybackConnections.end())
+			{
+				g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
+				it->second.second.Close();
+				g_audioPlaybackConnections.erase(it);
+				PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+			}
+		});
+
+		Grid deviceGrid;
+		ColumnDefinition deviceCol0;
+		deviceCol0.Width(GridLength(1, GridUnitType::Star));
+		ColumnDefinition deviceCol1;
+		deviceCol1.Width(GridLength(1, GridUnitType::Auto));
+		ColumnDefinition deviceCol2;
+		deviceCol2.Width(GridLength(1, GridUnitType::Auto));
+		deviceGrid.ColumnDefinitions().Append(deviceCol0);
+		deviceGrid.ColumnDefinitions().Append(deviceCol1);
+		deviceGrid.ColumnDefinitions().Append(deviceCol2);
+		deviceGrid.Children().Append(nameText);
+		deviceGrid.Children().Append(statusText);
+		deviceGrid.Children().Append(disconnectButton);
+		Grid::SetColumn(nameText, 0);
+		Grid::SetColumn(statusText, 1);
+		Grid::SetColumn(disconnectButton, 2);
+
+		Border deviceCard;
+		deviceCard.Child(deviceGrid);
+		deviceCard.Margin({ 12, 2, 12, 2 });
+		deviceCard.Padding({ 8, 8, 8, 8 });
+		deviceCard.CornerRadius(CornerRadius(4));
+		deviceCard.BorderThickness(Thickness(1));
+		deviceCard.BorderBrush(SolidColorBrush(Colors::LightGray()));
+
+		g_mainDeviceListPanel.Children().Append(deviceCard);
 	}
 }

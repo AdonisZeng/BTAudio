@@ -13,6 +13,7 @@ namespace fs = std::filesystem;
 
 constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
+constexpr UINT WM_REFRESHDEVICELIST = WM_APP + 3;
 
 HINSTANCE g_hInst;
 HWND g_hWnd;
@@ -37,6 +38,12 @@ NOTIFYICONIDENTIFIER g_niid = {
 UINT WM_TASKBAR_CREATED = 0;
 bool g_reconnect = false;
 std::vector<std::wstring> g_lastDevices;
+
+// Main window
+bool g_mainWindowVisible = false;
+StackPanel g_mainDeviceListPanel = nullptr;
+TextBlock g_mainNoDeviceText = nullptr;
+Grid g_mainWindowRoot = nullptr;
 
 #include "Util.hpp"
 #include "I18n.hpp"

@@ -1,5 +1,7 @@
-name: Build
+name: Release
 
+# 当推送形如 v1.2.3 的版本标签时自动编译打包并发布为 GitHub Release。
+# 也支持手动触发 (workflow_dispatch) 用于测试构建流程。
 on:
   push:
     tags: [ 'v*' ]
@@ -10,15 +12,19 @@ permissions:
 
 jobs:
   build:
+    name: Build (${{ matrix.arch }})
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { platform: x64,   arch: x64   }
-          - { platform: Win32, arch: x86   }
-          - { platform: ARM64, arch: ARM64 }
-          - { platform: ARM,   arch: ARM   }
+          # toolset: v145 是 VS 2026 默认工具集 (MSVC 14.5x)。
+          # 32 位 ARM 的 v145 在 GitHub runner 上不可用 (仅有 v142 14.29)，
+          # 因此 ARM 回退到 v142——32 位 ARM 已被微软弃用，仅作尽力构建。
+          - { platform: x64,   arch: x64,   toolset: v145 }
+          - { platform: Win32, arch: x86,   toolset: v145 }
+          - { platform: ARM64, arch: ARM64, toolset: v145 }
+          - { platform: ARM,   arch: ARM,   toolset: v142 }
     steps:
     - uses: actions/checkout@v4
       with:
@@ -43,10 +49,10 @@ jobs:
         ./gen_rc.sh
 
     # ---------------------------------------------------------------------------
-    # Auto-inject version from the git tag (e.g. v1.2.3) into resource.h so the
-    # compiled exe always carries the exact version of the tag, eliminating the
-    # "tag says 1.1.2 but exe says 1.1.1" mismatch caused by manual editing.
-    # Skipped for non-tag triggers (e.g. workflow_dispatch) — uses committed value.
+    # 从 git tag (如 v1.2.3) 自动提取版本号注入 resource.h，使编译出的 exe
+    # 始终携带与标签一致的版本，避免 "tag 写 1.1.2 但 exe 写 1.1.1" 的
+    # 手动编辑导致的不一致问题。非标签触发 (如 workflow_dispatch) 时跳过，
+    # 使用已提交的版本号。
     # ---------------------------------------------------------------------------
     - name: Inject version from git tag
       if: startsWith(github.ref, 'refs/tags/v')
@@ -70,14 +76,15 @@ jobs:
     - name: Restore NuGet packages
       run: nuget restore BTAudio.sln
 
-    # TargetName is overridden so the asset filename contains the arch keyword
-    # (x64/x86/ARM64/ARM) that UpdateChecker's ArchMatchesAsset() expects — the
-    # default "$(ProjectName)$(PlatformArchitecture)" yields "BTAudio64" which
-    # does NOT contain "x64" and would break automatic architecture matching.
+    # 覆盖 TargetName 使产物文件名包含架构关键字 (x64/x86/ARM64/ARM)，
+    # 这是 UpdateChecker 的 ArchMatchesAsset() 所需的——默认的
+    # "$(ProjectName)$(PlatformArchitecture)" 会生成 "BTAudio64"，
+    # 不包含 "x64"，会破坏自动架构匹配。
+    # 同时覆盖 PlatformToolset 以适配各架构 runner 上可用的工具集。
     - name: Build
       run: >
         msbuild BTAudio.sln
-        "-p:Configuration=Release;Platform=${{ matrix.platform }};OutDir=artifacts/${{ matrix.arch }}/;TargetName=BTAudio-${{ matrix.arch }}"
+        "-p:Configuration=Release;Platform=${{ matrix.platform }};PlatformToolset=${{ matrix.toolset }};OutDir=artifacts/${{ matrix.arch }}/;TargetName=BTAudio-${{ matrix.arch }}"
         -m -nologo
 
     - uses: actions/upload-artifact@v4
@@ -87,8 +94,11 @@ jobs:
         if-no-files-found: error
 
   release:
+    name: Publish Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # 使用 always() 使部分架构构建失败 (如 ARM) 时不阻塞发布——
+    # download-artifact 仅获取成功上传的产物，flatten 步骤会跳过缺失项。
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
     - uses: actions/download-artifact@v4
@@ -98,8 +108,14 @@ jobs:
       run: |
         mkdir -p flat
         find assets -name '*.exe' -exec cp {} flat/ \;
+        echo "--- artifacts to release ---"
         ls -la flat
-    - uses: softprops/action-gh-release@v2
+        if [ -z "$(ls -A flat 2>/dev/null)" ]; then
+          echo "::error::No .exe artifacts found — all builds failed, aborting release."
+          exit 1
+        fi
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
       with:
         files: flat/*.exe
         generate_release_notes: true

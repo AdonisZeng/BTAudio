@@ -4,6 +4,7 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
+void SetupSettingsFlyout();
 winrt::fire_and_forget ConnectDevice(DeviceInformation device);
 winrt::fire_and_forget ConnectDevice(std::wstring_view deviceId);
 void SetupDeviceWatcher();
@@ -76,6 +77,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	LoadSettings();
 	SetupFlyout();
 	SetupMenu();
+	SetupSettingsFlyout();
 	SetupDeviceWatcher();
 	SetupSvgIcon();
 	SetupMainWindow();
@@ -210,21 +212,15 @@ void SetupFlyout()
 	textBlock.Text(_(L"All connections will be closed.\nExit anyway?"));
 	textBlock.Margin({ 0, 0, 0, 12 });
 
-	static CheckBox checkbox;
-	checkbox.IsChecked(g_reconnect);
-	checkbox.Content(winrt::box_value(_(L"Reconnect on next start")));
-
 	Button button;
 	button.Content(winrt::box_value(_(L"Exit")));
 	button.HorizontalAlignment(HorizontalAlignment::Right);
 	button.Click([](const auto&, const auto&) {
-		g_reconnect = checkbox.IsChecked().Value();
 		PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
 	});
 
 	StackPanel stackPanel;
 	stackPanel.Children().Append(textBlock);
-	stackPanel.Children().Append(checkbox);
 	stackPanel.Children().Append(button);
 
 	Flyout flyout;
@@ -232,6 +228,46 @@ void SetupFlyout()
 	flyout.Content(stackPanel);
 
 	g_xamlFlyout = flyout;
+}
+
+void SetupSettingsFlyout()
+{
+	using namespace winrt::Windows::UI::Text;
+
+	TextBlock title;
+	title.Text(_(L"Settings"));
+	title.FontSize(16);
+	title.FontWeight(FontWeights::SemiBold());
+	title.Margin({ 0, 0, 0, 12 });
+
+	g_settingsReconnectCheckbox = CheckBox();
+	g_settingsReconnectCheckbox.IsChecked(g_reconnect);
+	g_settingsReconnectCheckbox.Content(winrt::box_value(_(L"Reconnect on next start")));
+	g_settingsReconnectCheckbox.Margin({ 0, 0, 0, 12 });
+	g_settingsReconnectCheckbox.Click([](const auto&, const auto&) {
+		g_reconnect = g_settingsReconnectCheckbox.IsChecked().Value();
+		SaveSettings();
+	});
+
+	Button closeButton;
+	closeButton.Content(winrt::box_value(_(L"Done")));
+	closeButton.HorizontalAlignment(HorizontalAlignment::Right);
+	closeButton.Click([](const auto&, const auto&) {
+		g_settingsFlyout.Hide();
+	});
+
+	StackPanel panel;
+	panel.Margin({ 16, 16, 16, 16 });
+	panel.Width(280);
+	panel.Children().Append(title);
+	panel.Children().Append(g_settingsReconnectCheckbox);
+	panel.Children().Append(closeButton);
+
+	Flyout flyout;
+	flyout.ShouldConstrainToRootBounds(false);
+	flyout.Content(panel);
+
+	g_settingsFlyout = flyout;
 }
 
 void SetupMenu()
@@ -492,6 +528,12 @@ void ApplyTheme()
 			content.RequestedTheme(theme);
 	}
 
+	if (g_settingsFlyout)
+	{
+		if (auto content = g_settingsFlyout.Content().try_as<FrameworkElement>())
+			content.RequestedTheme(theme);
+	}
+
 	if (g_xamlMenu)
 	{
 		for (auto const& item : g_xamlMenu.Items())
@@ -621,11 +663,27 @@ void SetupMainWindow()
 	bottomSeparator.Background(SolidColorBrush(Colors::LightGray()));
 	bottomSeparator.Margin({ 0, 8, 0, 4 });
 
-	// Button: Bluetooth Settings
+	// Bottom button bar: [Settings] [Bluetooth Settings] [Exit] in one row
+	Button appSettingsButton;
+	appSettingsButton.Content(winrt::box_value(L"\xE713"));
+	appSettingsButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+	appSettingsButton.FontSize(14);
+	appSettingsButton.Width(40);
+	appSettingsButton.Height(32);
+	appSettingsButton.Margin({ 0, 0, 0, 0 });
+	appSettingsButton.HorizontalContentAlignment(HorizontalAlignment::Center);
+	appSettingsButton.VerticalContentAlignment(VerticalAlignment::Center);
+	appSettingsButton.Click([](const auto& sender, const auto&) {
+		// Sync checkbox with current value before showing
+		if (g_settingsReconnectCheckbox)
+			g_settingsReconnectCheckbox.IsChecked(g_reconnect);
+		g_settingsFlyout.ShowAt(sender.template as<FrameworkElement>());
+	});
+
 	Button settingsButton;
 	settingsButton.Content(winrt::box_value(_(L"Bluetooth Settings")));
-	settingsButton.Margin({ 12, 4, 12, 2 });
-	settingsButton.HorizontalAlignment(HorizontalAlignment::Stretch);
+	settingsButton.Height(32);
+	settingsButton.Margin({ 0, 0, 0, 0 });
 	settingsButton.Click([](const auto&, const auto&) {
 		winrt::Windows::System::Launcher::LaunchUriAsync(Uri(L"ms-settings:bluetooth"));
 	});
@@ -633,8 +691,9 @@ void SetupMainWindow()
 	// Button: Exit
 	Button exitButton;
 	exitButton.Content(winrt::box_value(_(L"Exit")));
-	exitButton.Margin({ 12, 2, 12, 8 });
-	exitButton.HorizontalAlignment(HorizontalAlignment::Stretch);
+	exitButton.MinWidth(72);
+	exitButton.Height(32);
+	exitButton.Margin({ 0, 0, 0, 0 });
 	exitButton.Click([](const auto&, const auto&) {
 		if (g_audioPlaybackConnections.size() == 0)
 		{
@@ -662,6 +721,16 @@ void SetupMainWindow()
 		g_xamlFlyout.ShowAt(g_xamlCanvas);
 	});
 
+	// Bottom bar: evenly distributed horizontal buttons
+	StackPanel bottomBar;
+	bottomBar.Orientation(Orientation::Horizontal);
+	bottomBar.HorizontalAlignment(HorizontalAlignment::Center);
+	bottomBar.Padding({ 12, 4, 12, 8 });
+	bottomBar.Spacing(8);
+	bottomBar.Children().Append(appSettingsButton);
+	bottomBar.Children().Append(settingsButton);
+	bottomBar.Children().Append(exitButton);
+
 	// Main layout (Grid so both device lists share the remaining vertical space)
 	g_mainWindowRoot = Grid();
 	RowDefinition rowTitle;
@@ -680,10 +749,8 @@ void SetupMainWindow()
 	rowAvailList.Height(GridLength(1, GridUnitType::Star));
 	RowDefinition rowBotSep;
 	rowBotSep.Height(GridLength(1, GridUnitType::Pixel));
-	RowDefinition rowSettings;
-	rowSettings.Height(GridLength(1, GridUnitType::Auto));
-	RowDefinition rowExit;
-	rowExit.Height(GridLength(1, GridUnitType::Auto));
+	RowDefinition rowBottomBar;
+	rowBottomBar.Height(GridLength(1, GridUnitType::Auto));
 	g_mainWindowRoot.RowDefinitions().Append(rowTitle);
 	g_mainWindowRoot.RowDefinitions().Append(rowSep1);
 	g_mainWindowRoot.RowDefinitions().Append(rowConnHeader);
@@ -692,8 +759,7 @@ void SetupMainWindow()
 	g_mainWindowRoot.RowDefinitions().Append(rowAvailHeader);
 	g_mainWindowRoot.RowDefinitions().Append(rowAvailList);
 	g_mainWindowRoot.RowDefinitions().Append(rowBotSep);
-	g_mainWindowRoot.RowDefinitions().Append(rowSettings);
-	g_mainWindowRoot.RowDefinitions().Append(rowExit);
+	g_mainWindowRoot.RowDefinitions().Append(rowBottomBar);
 
 	g_mainWindowRoot.Children().Append(titleBar);
 	g_mainWindowRoot.Children().Append(titleSeparator);
@@ -703,8 +769,7 @@ void SetupMainWindow()
 	g_mainWindowRoot.Children().Append(availableHeader);
 	g_mainWindowRoot.Children().Append(availableScrollViewer);
 	g_mainWindowRoot.Children().Append(bottomSeparator);
-	g_mainWindowRoot.Children().Append(settingsButton);
-	g_mainWindowRoot.Children().Append(exitButton);
+	g_mainWindowRoot.Children().Append(bottomBar);
 
 	Grid::SetRow(titleBar, 0);
 	Grid::SetRow(titleSeparator, 1);
@@ -714,15 +779,14 @@ void SetupMainWindow()
 	Grid::SetRow(availableHeader, 5);
 	Grid::SetRow(availableScrollViewer, 6);
 	Grid::SetRow(bottomSeparator, 7);
-	Grid::SetRow(settingsButton, 8);
-	Grid::SetRow(exitButton, 9);
+	Grid::SetRow(bottomBar, 8);
 
 	g_xamlCanvas.Children().Append(g_mainWindowRoot);
 }
 
 void ShowMainWindow()
 {
-	const float windowWidth = 380.0f;
+	const float windowWidth = 420.0f;
 	const float windowHeight = 480.0f;
 	auto dpi = GetDpiForWindow(g_hWnd);
 	auto scale = static_cast<float>(dpi) / USER_DEFAULT_SCREEN_DPI;

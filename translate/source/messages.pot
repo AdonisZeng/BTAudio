@@ -64,6 +64,14 @@ msgstr ""
 msgid "Unknown error"
 msgstr ""
 
-#: AudioPlaybackConnector.cpp:362
+#: BTAudio.cpp
 msgid "Connected"
+msgstr ""
+
+#: BTAudio.cpp
+msgid "Settings"
+msgstr ""
+
+#: BTAudio.cpp
+msgid "Done"
 msgstr ""

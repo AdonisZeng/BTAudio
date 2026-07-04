@@ -60,6 +60,10 @@ Grid g_mainWindowRoot = nullptr;
 // Update checker
 Flyout g_updateFlyout = nullptr;
 
+// Settings flyout (BTAudio program settings)
+Flyout g_settingsFlyout = nullptr;
+CheckBox g_settingsReconnectCheckbox = nullptr;
+
 #include "Util.hpp"
 #include "I18n.hpp"
 #include "SettingsUtil.hpp"

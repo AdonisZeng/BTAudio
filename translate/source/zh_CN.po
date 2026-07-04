@@ -69,3 +69,11 @@ msgstr "未知错误"
 #: AudioPlaybackConnector.cpp:362
 msgid "Connected"
 msgstr "已连接"
+
+#: BTAudio.cpp
+msgid "Settings"
+msgstr "设置"
+
+#: BTAudio.cpp
+msgid "Done"
+msgstr "完成"

@@ -2,115 +2,108 @@ name: Build
 
 on:
   push:
-    tags: [ '**' ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: x64,   arch: x64   }
+          - { platform: Win32, arch: x86   }
+          - { platform: ARM64, arch: ARM64 }
+          - { platform: ARM,   arch: ARM   }
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         submodules: true
+
     - name: Add msbuild to PATH
-      uses: microsoft/setup-msbuild@v1.0.0
+      uses: microsoft/setup-msbuild@v1.1
+
     - uses: nuget/setup-nuget@v1
       with:
         nuget-version: latest
-    - uses: actions/setup-python@v1
+
+    - uses: actions/setup-python@v5
       with:
-        python-version: 3.7
-    - run: |
+        python-version: '3.9'
+
+    - name: Generate translation resources
+      shell: bash
+      run: |
         cd translate
         pip install -r requirements.txt
         ./gen_rc.sh
+
+    # ---------------------------------------------------------------------------
+    # Auto-inject version from the git tag (e.g. v1.2.3) into resource.h so the
+    # compiled exe always carries the exact version of the tag, eliminating the
+    # "tag says 1.1.2 but exe says 1.1.1" mismatch caused by manual editing.
+    # Skipped for non-tag triggers (e.g. workflow_dispatch) — uses committed value.
+    # ---------------------------------------------------------------------------
+    - name: Inject version from git tag
+      if: startsWith(github.ref, 'refs/tags/v')
       shell: bash
-    - run: nuget restore AudioPlaybackConnector.sln
-    - run: |
-        Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
-          msbuild AudioPlaybackConnector.sln "-p:Configuration=Release;Platform=x64" }
-        Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
-          msbuild AudioPlaybackConnector.sln "-p:Configuration=Release;Platform=x86" }
-        Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
-          msbuild AudioPlaybackConnector.sln "-p:Configuration=Release;Platform=ARM64" }
-        Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
-          msbuild AudioPlaybackConnector.sln "-p:Configuration=Release;Platform=ARM" }
-        Get-Job | Wait-Job | Receive-Job
-      shell: powershell
-    - uses: actions/upload-artifact@v2
+      run: |
+        tag="${GITHUB_REF_NAME}"
+        ver="${tag#v}"
+        IFS='.' read -r major minor patch <<< "$ver"
+        : "${major:=0}"; : "${minor:=0}"; : "${patch:=0}"
+        echo "Injecting version ${major}.${minor}.${patch} into resource.h"
+        sed -i \
+          -e "s|^#define BTAUDIO_VERSION_MAJOR .*|#define BTAUDIO_VERSION_MAJOR      ${major}|" \
+          -e "s|^#define BTAUDIO_VERSION_MINOR .*|#define BTAUDIO_VERSION_MINOR      ${minor}|" \
+          -e "s|^#define BTAUDIO_VERSION_PATCH .*|#define BTAUDIO_VERSION_PATCH      ${patch}|" \
+          -e "s|^#define BTAUDIO_VERSION_STR .*|#define BTAUDIO_VERSION_STR        L\"${major}.${minor}.${patch}.0\"|" \
+          -e "s|^#define BTAUDIO_VERSION_WSTR .*|#define BTAUDIO_VERSION_WSTR       L\"v${major}.${minor}.${patch}\"|" \
+          resource.h
+        echo "--- resource.h after injection ---"
+        grep BTAUDIO_VERSION_ resource.h
+
+    - name: Restore NuGet packages
+      run: nuget restore BTAudio.sln
+
+    # TargetName is overridden so the asset filename contains the arch keyword
+    # (x64/x86/ARM64/ARM) that UpdateChecker's ArchMatchesAsset() expects — the
+    # default "$(ProjectName)$(PlatformArchitecture)" yields "BTAudio64" which
+    # does NOT contain "x64" and would break automatic architecture matching.
+    - name: Build
+      run: >
+        msbuild BTAudio.sln
+        "-p:Configuration=Release;Platform=${{ matrix.platform }};OutDir=artifacts/${{ matrix.arch }}/;TargetName=BTAudio-${{ matrix.arch }}"
+        -m -nologo
+
+    - uses: actions/upload-artifact@v4
       with:
-        name: AudioPlaybackConnector64
-        path: x64/Release/AudioPlaybackConnector64.exe
-    - uses: actions/upload-artifact@v2
+        name: BTAudio-${{ matrix.arch }}
+        path: artifacts/${{ matrix.arch }}/BTAudio-${{ matrix.arch }}.exe
+        if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/download-artifact@v4
       with:
-        name: AudioPlaybackConnector64
-        path: x64/Release/AudioPlaybackConnector64.pdb
-    - uses: actions/upload-artifact@v2
+        path: assets
+    - name: Flatten artifacts
+      run: |
+        mkdir -p flat
+        find assets -name '*.exe' -exec cp {} flat/ \;
+        ls -la flat
+    - uses: softprops/action-gh-release@v2
       with:
-        name: AudioPlaybackConnector32
-        path: Release/AudioPlaybackConnector32.exe
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnector32
-        path: Release/AudioPlaybackConnector32.pdb
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnectorARM64
-        path: ARM64/Release/AudioPlaybackConnectorARM64.exe
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnectorARM64
-        path: ARM64/Release/AudioPlaybackConnectorARM64.pdb
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnectorARM
-        path: ARM/Release/AudioPlaybackConnectorARM.exe
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnectorARM
-        path: ARM/Release/AudioPlaybackConnectorARM.pdb
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: ${{ github.ref }}
-        draft: true
+        files: flat/*.exe
+        generate_release_notes: true
+        draft: false
         prerelease: false
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: x64/Release/AudioPlaybackConnector64.exe
-        asset_name: AudioPlaybackConnector64.exe
-        asset_content_type: application/octet-stream
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: Release/AudioPlaybackConnector32.exe
-        asset_name: AudioPlaybackConnector32.exe
-        asset_content_type: application/octet-stream
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ARM64/Release/AudioPlaybackConnectorARM64.exe
-        asset_name: AudioPlaybackConnectorARM64.exe
-        asset_content_type: application/octet-stream
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ARM/Release/AudioPlaybackConnectorARM.exe
-        asset_name: AudioPlaybackConnectorARM.exe
-        asset_content_type: application/octet-stream

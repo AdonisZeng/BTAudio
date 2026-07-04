@@ -34,6 +34,15 @@ std::map<std::wstring, DeviceInformation> g_availableDevices;
 std::unordered_map<std::wstring, std::wstring> g_connectingDevices;
 // id -> (DeviceInformation, AudioPlaybackConnection)
 std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConnection>> g_audioPlaybackConnections;
+// Pending reconnect attempts scheduled via SetTimer, keyed by timer id.
+// The timer callback fires inside the message loop, so all map accesses stay
+// on the UI thread (same thread that owns the connection maps above).
+struct PendingReconnect
+{
+	std::wstring deviceId;
+	int retryCount;
+};
+std::map<UINT_PTR, PendingReconnect> g_pendingReconnects;
 HICON g_hIconLight = nullptr;
 HICON g_hIconDark = nullptr;
 NOTIFYICONDATAW g_nid = {

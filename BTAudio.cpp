@@ -5,8 +5,8 @@ LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
 void SetupSettingsFlyout();
-winrt::fire_and_forget ConnectDevice(DeviceInformation device);
-winrt::fire_and_forget ConnectDevice(std::wstring_view deviceId);
+winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount = 2);
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount = 2);
 void SetupDeviceWatcher();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
@@ -346,7 +346,25 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
-winrt::fire_and_forget ConnectDevice(DeviceInformation device)
+// One-shot timer callback used to schedule a reconnect attempt on the UI thread
+// after a short backoff. SetTimer callbacks fire inside the message loop, so all
+// accesses to the connection maps stay single-threaded.
+VOID CALLBACK ReconnectTimerProc(HWND hwnd, UINT, UINT_PTR idEvent, DWORD)
+{
+	KillTimer(hwnd, idEvent);
+	auto it = g_pendingReconnects.find(idEvent);
+	if (it != g_pendingReconnects.end())
+	{
+		PendingReconnect pr = std::move(it->second);
+		g_pendingReconnects.erase(it);
+		// deviceId is moved into the coroutine frame (passed by value), so it is
+		// safe across the suspension points inside ConnectDevice even though this
+		// stack frame returns immediately afterwards.
+		ConnectDevice(std::move(pr.deviceId), pr.retryCount);
+	}
+}
+
+winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount)
 {
 	const std::wstring deviceId(device.Id());
 	const std::wstring deviceName(device.Name());
@@ -356,6 +374,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 
 	bool success = false;
+	bool shouldRetry = false; // true for transient failures (timeout / unknown)
 	std::wstring errorMessage;
 
 	try
@@ -400,6 +419,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::RequestTimedOut:
 				success = false;
+				shouldRetry = true;
 				errorMessage = _(L"The request timed out");
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::DeniedBySystem:
@@ -407,8 +427,21 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 				errorMessage = _(L"The operation was denied by the system");
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::UnknownFailure:
+				// Treat as transient: format the extended HRESULT for diagnostics
+				// without throwing, so the unified retry path below can handle it.
 				success = false;
-				winrt::throw_hresult(result.ExtendedError());
+				shouldRetry = true;
+				{
+					auto hr = result.ExtendedError();
+					errorMessage.resize(64);
+					auto n = swprintf(errorMessage.data(), errorMessage.size(),
+						L"%ls (0x%08X)", _(L"Unknown failure"),
+						static_cast<uint32_t>(hr));
+					if (n > 0)
+						errorMessage.resize(n);
+					else
+						errorMessage = _(L"Unknown failure");
+				}
 				break;
 			}
 		}
@@ -449,16 +482,42 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			it->second.second.Close();
 			g_audioPlaybackConnections.erase(it);
 		}
+
+		// Retry transient failures (timeout / unknown) with a short backoff so the
+		// user does not have to manually toggle Bluetooth. The retry runs back on
+		// the UI thread via a one-shot SetTimer, keeping map access single-threaded.
+		if (shouldRetry && retryCount > 0)
+		{
+			// Keep showing the "Connecting" state while we wait out the backoff.
+			g_connectingDevices.emplace(deviceId, deviceName);
+			if (UINT_PTR timerId = SetTimer(g_hWnd, 0, 500, ReconnectTimerProc))
+				g_pendingReconnects[timerId] = { deviceId, retryCount - 1 };
+			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+			co_return;
+		}
 		// TODO: errorMessage is currently discarded. A future enhancement could
 		// surface it inline in the available-device card. For now we just refresh.
 	}
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 }
 
-winrt::fire_and_forget ConnectDevice(std::wstring_view deviceId)
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount)
 {
-	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
-	ConnectDevice(device);
+	// deviceId is owned by the coroutine frame (passed by value), so it remains
+	// valid across the suspension point below.
+	try
+	{
+		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+		ConnectDevice(device, retryCount);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		// The device may have left range between scheduling the retry and firing
+		// it; silently drop the retry and refresh the UI.
+		LOG_CAUGHT_EXCEPTION();
+		g_connectingDevices.erase(deviceId);
+		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+	}
 }
 
 void SetupDeviceWatcher()
@@ -875,50 +934,88 @@ void RefreshDeviceList()
 				statusText.VerticalAlignment(VerticalAlignment::Center);
 				statusText.Margin({ 8, 0, 0, 0 });
 
-				Button disconnectButton;
-				disconnectButton.Content(winrt::box_value(L"\xE8BB"));
-				disconnectButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
-				disconnectButton.FontSize(10);
-				disconnectButton.Padding(ThicknessHelper::FromUniformLength(0));
-				disconnectButton.MinWidth(28);
-				disconnectButton.MinHeight(28);
-				disconnectButton.Width(28);
-				disconnectButton.Height(28);
-				disconnectButton.Margin({ 4, 0, 0, 0 });
-				disconnectButton.HorizontalContentAlignment(HorizontalAlignment::Center);
-				disconnectButton.VerticalContentAlignment(VerticalAlignment::Center);
-				disconnectButton.Background(SolidColorBrush(Colors::Transparent()));
-				disconnectButton.Foreground(SolidColorBrush(Colors::Gray()));
-				disconnectButton.HorizontalAlignment(HorizontalAlignment::Right);
-				disconnectButton.VerticalAlignment(VerticalAlignment::Center);
+			Button reconnectButton;
+			reconnectButton.Content(winrt::box_value(L"\xE72C")); // Refresh icon
+			reconnectButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+			reconnectButton.FontSize(10);
+			reconnectButton.Padding(ThicknessHelper::FromUniformLength(0));
+			reconnectButton.MinWidth(28);
+			reconnectButton.MinHeight(28);
+			reconnectButton.Width(28);
+			reconnectButton.Height(28);
+			reconnectButton.Margin({ 4, 0, 0, 0 });
+			reconnectButton.HorizontalContentAlignment(HorizontalAlignment::Center);
+			reconnectButton.VerticalContentAlignment(VerticalAlignment::Center);
+			reconnectButton.Background(SolidColorBrush(Colors::Transparent()));
+			reconnectButton.Foreground(SolidColorBrush(Colors::Gray()));
+			reconnectButton.VerticalAlignment(VerticalAlignment::Center);
+			ToolTipService::SetToolTip(reconnectButton, winrt::box_value(_(L"Reconnect")));
 
-				std::wstring deviceId(id);
-				disconnectButton.Click([deviceId](const auto&, const auto&) {
-					auto it = g_audioPlaybackConnections.find(deviceId);
-					if (it != g_audioPlaybackConnections.end())
-					{
-						it->second.second.Close();
-						g_audioPlaybackConnections.erase(it);
-						PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
-					}
-				});
+			Button disconnectButton;
+			disconnectButton.Content(winrt::box_value(L"\xE8BB"));
+			disconnectButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+			disconnectButton.FontSize(10);
+			disconnectButton.Padding(ThicknessHelper::FromUniformLength(0));
+			disconnectButton.MinWidth(28);
+			disconnectButton.MinHeight(28);
+			disconnectButton.Width(28);
+			disconnectButton.Height(28);
+			disconnectButton.Margin({ 4, 0, 0, 0 });
+			disconnectButton.HorizontalContentAlignment(HorizontalAlignment::Center);
+			disconnectButton.VerticalContentAlignment(VerticalAlignment::Center);
+			disconnectButton.Background(SolidColorBrush(Colors::Transparent()));
+			disconnectButton.Foreground(SolidColorBrush(Colors::Gray()));
+			disconnectButton.VerticalAlignment(VerticalAlignment::Center);
+			ToolTipService::SetToolTip(disconnectButton, winrt::box_value(_(L"Disconnect")));
 
-				Grid deviceGrid;
-				ColumnDefinition deviceCol0;
-				deviceCol0.Width(GridLength(1, GridUnitType::Star));
-				ColumnDefinition deviceCol1;
-				deviceCol1.Width(GridLength(1, GridUnitType::Auto));
-				ColumnDefinition deviceCol2;
-				deviceCol2.Width(GridLength(1, GridUnitType::Auto));
-				deviceGrid.ColumnDefinitions().Append(deviceCol0);
-				deviceGrid.ColumnDefinitions().Append(deviceCol1);
-				deviceGrid.ColumnDefinitions().Append(deviceCol2);
-				deviceGrid.Children().Append(nameText);
-				deviceGrid.Children().Append(statusText);
-				deviceGrid.Children().Append(disconnectButton);
-				Grid::SetColumn(nameText, 0);
-				Grid::SetColumn(statusText, 1);
-				Grid::SetColumn(disconnectButton, 2);
+			std::wstring deviceId(id);
+			reconnectButton.Click([deviceId](const auto&, const auto&) {
+				auto it = g_audioPlaybackConnections.find(deviceId);
+				if (it != g_audioPlaybackConnections.end())
+				{
+					// Capture the DeviceInformation before tearing down the current
+					// connection, then re-initiate with a fresh retry budget. This
+					// forces the Bluetooth stack to re-negotiate AVDTP/L2CAP, which
+					// is the most reliable way to break a "connected-but-silent"
+					// deadlock without asking the user to toggle Bluetooth.
+					DeviceInformation device = it->second.first;
+					it->second.second.Close();
+					g_audioPlaybackConnections.erase(it);
+					PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+					ConnectDevice(device, 2);
+				}
+			});
+			disconnectButton.Click([deviceId](const auto&, const auto&) {
+				auto it = g_audioPlaybackConnections.find(deviceId);
+				if (it != g_audioPlaybackConnections.end())
+				{
+					it->second.second.Close();
+					g_audioPlaybackConnections.erase(it);
+					PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+				}
+			});
+
+			Grid deviceGrid;
+			ColumnDefinition deviceCol0;
+			deviceCol0.Width(GridLength(1, GridUnitType::Star));
+			ColumnDefinition deviceCol1;
+			deviceCol1.Width(GridLength(1, GridUnitType::Auto));
+			ColumnDefinition deviceCol2;
+			deviceCol2.Width(GridLength(1, GridUnitType::Auto));
+			ColumnDefinition deviceCol3;
+			deviceCol3.Width(GridLength(1, GridUnitType::Auto));
+			deviceGrid.ColumnDefinitions().Append(deviceCol0);
+			deviceGrid.ColumnDefinitions().Append(deviceCol1);
+			deviceGrid.ColumnDefinitions().Append(deviceCol2);
+			deviceGrid.ColumnDefinitions().Append(deviceCol3);
+			deviceGrid.Children().Append(nameText);
+			deviceGrid.Children().Append(statusText);
+			deviceGrid.Children().Append(reconnectButton);
+			deviceGrid.Children().Append(disconnectButton);
+			Grid::SetColumn(nameText, 0);
+			Grid::SetColumn(statusText, 1);
+			Grid::SetColumn(reconnectButton, 2);
+			Grid::SetColumn(disconnectButton, 3);
 
 				Border deviceCard;
 				deviceCard.Child(deviceGrid);

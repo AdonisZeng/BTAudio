@@ -8,6 +8,7 @@ void DefaultSettings()
 	g_reconnect = false;
 	g_autoStart = false;
 	g_lastDevices.clear();
+	g_deviceAliases.clear();
 }
 
 void LoadSettings()
@@ -49,6 +50,17 @@ void LoadSettings()
 			if (i.ValueType() == JsonValueType::String)
 				g_lastDevices.push_back(std::wstring(i.GetString()));
 		}
+
+		// Load device aliases (deviceId -> custom display name).
+		// Older settings files won't have this key; absence is fine.
+		if (jsonObj.HasKey(L"aliases"))
+		{
+			auto aliases = jsonObj.Lookup(L"aliases").GetObject();
+			for (const auto& pair : aliases)
+			{
+				g_deviceAliases[std::wstring(pair.Key())] = std::wstring(pair.Value().GetString());
+			}
+		}
 	}
 	CATCH_LOG();
 }
@@ -67,6 +79,13 @@ void SaveSettings()
 			lastDevices.Append(JsonValue::CreateStringValue(i.first));
 		}
 		jsonObj.Insert(L"lastDevices", lastDevices);
+
+		JsonObject aliases;
+		for (const auto& [id, alias] : g_deviceAliases)
+		{
+			aliases.Insert(id, JsonValue::CreateStringValue(alias));
+		}
+		jsonObj.Insert(L"aliases", aliases);
 
 		wil::unique_hfile hFile(CreateFileW((GetModuleFsPath(g_hInst).remove_filename() / CONFIG_NAME).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
 		THROW_LAST_ERROR_IF(!hFile);

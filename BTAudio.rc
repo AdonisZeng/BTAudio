@@ -86,7 +86,7 @@ BEGIN
     BEGIN
         BLOCK "040004b0"
         BEGIN
-            VALUE "CompanyName", "Richard Yu"
+            VALUE "CompanyName", "AdonisZeng"
             VALUE "FileDescription", "BTAudio"
             VALUE "FileVersion", BTAUDIO_VERSION_STR
             VALUE "InternalName", "BTAudio.exe"

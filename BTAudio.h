@@ -18,6 +18,10 @@ constexpr UINT WM_UPDATEAVAILABLE = WM_APP + 4;
 constexpr UINT WM_UPTODATE = WM_APP + 5;
 constexpr UINT WM_UPDATEFAILED = WM_APP + 6;
 
+// Timer ID for the startup-delay reconnect (gives Bluetooth services time to
+// initialize before attempting to reconnect, especially when auto-starting).
+constexpr UINT_PTR IDT_STARTUP_DELAY = 1001;
+
 HINSTANCE g_hInst;
 HWND g_hWnd;
 HWND g_hWndXaml;
@@ -65,6 +69,9 @@ UINT WM_TASKBAR_CREATED = 0;
 bool g_reconnect = false;
 bool g_autoStart = false;
 std::vector<std::wstring> g_lastDevices;
+// User-defined display aliases for devices (deviceId -> custom name).
+// Does NOT affect system Bluetooth pairing names — only the BTAudio UI.
+std::map<std::wstring, std::wstring> g_deviceAliases;
 
 // Main window
 bool g_mainWindowVisible = false;
@@ -82,11 +89,20 @@ Flyout g_settingsFlyout = nullptr;
 CheckBox g_settingsReconnectCheckbox = nullptr;
 CheckBox g_settingsAutoStartCheckbox = nullptr;
 
+// Rename flyout (for setting local device aliases)
+Flyout g_renameFlyout = nullptr;
+TextBox g_renameTextBox = nullptr;
+std::wstring g_renamingDeviceId;
+
 // Forward declarations — must appear before the .hpp includes so that
 // settings / utility helpers can call these functions.
 void ShowNotification(const std::wstring& title, const std::wstring& message, DWORD dwInfoFlags = NIIF_INFO);
 bool IsAutoStartEnabled();
 void SetAutoStart(bool enable);
+void SetupRenameFlyout();
+std::wstring GetDeviceDisplayName(const std::wstring& deviceId, std::wstring_view defaultName);
+int GetDeviceBatteryLevel(const std::wstring& deviceId);
+VOID CALLBACK StartupDelayTimerProc(HWND, UINT, UINT_PTR, DWORD);
 
 #include "Util.hpp"
 #include "I18n.hpp"

@@ -16,6 +16,10 @@ void ShowMainWindow();
 void HideMainWindow();
 void RefreshDeviceList();
 void ShowUpdateDialog();
+void SetupRenameFlyout();
+std::wstring GetDeviceDisplayName(const std::wstring& deviceId, std::wstring_view defaultName);
+int GetDeviceBatteryLevel(const std::wstring& deviceId);
+VOID CALLBACK StartupDelayTimerProc(HWND, UINT, UINT_PTR, DWORD);
 
 // ---------------------------------------------------------------------------
 // Pop a balloon / action-centre notification through the tray icon.
@@ -76,6 +80,44 @@ void SetAutoStart(bool enable)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Get the display name for a device — returns the user-defined alias if one
+// is set, otherwise returns the device's real name.
+// ---------------------------------------------------------------------------
+std::wstring GetDeviceDisplayName(const std::wstring& deviceId, std::wstring_view defaultName)
+{
+	auto it = g_deviceAliases.find(deviceId);
+	if (it != g_deviceAliases.end() && !it->second.empty())
+		return it->second;
+	return std::wstring(defaultName);
+}
+
+// ---------------------------------------------------------------------------
+// Get the battery level (0-100) for a device from the DeviceWatcher's
+// additional properties. Returns -1 if the battery level is unknown.
+// Property key: DEVPKEY_Device_BatteryLevel {104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2
+// ---------------------------------------------------------------------------
+int GetDeviceBatteryLevel(const std::wstring& deviceId)
+{
+	auto it = g_availableDevices.find(deviceId);
+	if (it == g_availableDevices.end())
+		return -1;
+
+	try
+	{
+		auto props = it->second.Properties();
+		auto val = props.Lookup(L"{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2");
+		if (!val)
+			return -1;
+		// The property may be boxed as different integer types.
+		try { return static_cast<int>(winrt::unbox_value<uint8_t>(val)); } catch (...) {}
+		try { return static_cast<int>(winrt::unbox_value<uint32_t>(val)); } catch (...) {}
+		try { return winrt::unbox_value<int32_t>(val); } catch (...) {}
+	}
+	catch (...) {}
+	return -1;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
 	_In_ LPWSTR    lpCmdLine,
@@ -84,6 +126,17 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	UNREFERENCED_PARAMETER(hPrevInstance);
 	UNREFERENCED_PARAMETER(lpCmdLine);
 	UNREFERENCED_PARAMETER(nCmdShow);
+
+	// Single-instance check — prevent multiple instances from running
+	// simultaneously, which would create duplicate tray icons and conflict
+	// over the same settings file / Bluetooth connections.
+	HANDLE hSingleInstance = CreateMutexW(nullptr, TRUE, L"BTAudio_SingleInstance");
+	if (GetLastError() == ERROR_ALREADY_EXISTS)
+	{
+		if (hSingleInstance)
+			CloseHandle(hSingleInstance);
+		return EXIT_SUCCESS;
+	}
 
 	g_hInst = hInstance;
 
@@ -140,6 +193,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	SetupFlyout();
 	SetupMenu();
 	SetupSettingsFlyout();
+	SetupRenameFlyout();
 	SetupDeviceWatcher();
 	SetupSvgIcon();
 	SetupMainWindow();
@@ -152,7 +206,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
 	LOG_LAST_ERROR_IF(WM_TASKBAR_CREATED == 0);
 
-	PostMessageW(g_hWnd, WM_CONNECTDEVICE, 0, 0);
+	// Delay the initial reconnect to give Bluetooth services time to
+	// initialize. This is especially important when auto-starting with
+	// Windows, where the Bluetooth radio may not be ready at logon.
+	SetTimer(g_hWnd, IDT_STARTUP_DELAY, 5000, StartupDelayTimerProc);
 
 	// Silently check for updates on startup.
 	CheckForUpdate(true);
@@ -350,6 +407,54 @@ void SetupSettingsFlyout()
 	g_settingsFlyout = flyout;
 }
 
+// ---------------------------------------------------------------------------
+// Rename flyout — lets the user set a local alias for a device. The alias is
+// shown in the UI everywhere the device name would appear, but does not
+// affect the system Bluetooth pairing name.
+// ---------------------------------------------------------------------------
+void SetupRenameFlyout()
+{
+	using namespace winrt::Windows::UI::Text;
+
+	TextBlock title;
+	title.Text(_(L"Set Device Alias"));
+	title.FontSize(14);
+	title.FontWeight(FontWeights::SemiBold());
+	title.Margin({ 0, 0, 0, 8 });
+
+	g_renameTextBox = TextBox();
+	g_renameTextBox.PlaceholderText(_(L"Enter custom name (leave empty to reset)"));
+	g_renameTextBox.Margin({ 0, 0, 0, 8 });
+
+	Button saveButton;
+	saveButton.Content(winrt::box_value(_(L"Save")));
+	saveButton.HorizontalAlignment(HorizontalAlignment::Right);
+	saveButton.Click([](const auto&, const auto&) {
+		auto text = g_renameTextBox.Text();
+		if (text.empty())
+			g_deviceAliases.erase(g_renamingDeviceId);
+		else
+			g_deviceAliases[g_renamingDeviceId] = std::wstring(text);
+		SaveSettings();
+		g_renameFlyout.Hide();
+		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+		UpdateNotifyIcon();
+	});
+
+	StackPanel panel;
+	panel.Margin({ 12, 12, 12, 12 });
+	panel.Width(260);
+	panel.Children().Append(title);
+	panel.Children().Append(g_renameTextBox);
+	panel.Children().Append(saveButton);
+
+	Flyout flyout;
+	flyout.ShouldConstrainToRootBounds(false);
+	flyout.Content(panel);
+
+	g_renameFlyout = flyout;
+}
+
 void SetupMenu()
 {
 	// https://docs.microsoft.com/en-us/windows/uwp/design/style/segoe-ui-symbol-font
@@ -426,6 +531,15 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
+// One-shot timer that fires after a short delay to initiate the initial
+// reconnect. This gives Bluetooth services time to initialize when the
+// app is auto-started with Windows.
+VOID CALLBACK StartupDelayTimerProc(HWND hwnd, UINT, UINT_PTR idEvent, DWORD)
+{
+	KillTimer(hwnd, idEvent);
+	PostMessageW(hwnd, WM_CONNECTDEVICE, 0, 0);
+}
+
 // One-shot timer callback used to schedule a reconnect attempt on the UI thread
 // after a short backoff. SetTimer callbacks fire inside the message loop, so all
 // accesses to the connection maps stay single-threaded.
@@ -448,8 +562,10 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount)
 {
 	const std::wstring deviceId(device.Id());
 	const std::wstring deviceName(device.Name());
+	const std::wstring displayName(GetDeviceDisplayName(deviceId, deviceName));
 
 	// Mark the device as "connecting" so the available list can show progress.
+	// Store the real name; the UI applies the alias at display time.
 	g_connectingDevices.emplace(deviceId, deviceName);
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 
@@ -481,7 +597,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount)
 					auto it = g_audioPlaybackConnections.find(deviceId);
 					if (it != g_audioPlaybackConnections.end())
 					{
-						deviceName = it->second.first.Name();
+						deviceName = GetDeviceDisplayName(deviceId, it->second.first.Name());
 						g_audioPlaybackConnections.erase(it);
 					}
 					g_connectingDevices.erase(deviceId);
@@ -579,12 +695,12 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount)
 			co_return;
 		}
 		// Surface failure via toast notification so the user is aware.
-		ShowNotification(deviceName, errorMessage, NIIF_ERROR);
+		ShowNotification(displayName, errorMessage, NIIF_ERROR);
 	}
 	else
 	{
 		// Connection succeeded — notify the user.
-		ShowNotification(deviceName, _(L"Connected successfully"), NIIF_INFO);
+		ShowNotification(displayName, _(L"Connected successfully"), NIIF_INFO);
 	}
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 	UpdateNotifyIcon();
@@ -615,7 +731,13 @@ void SetupDeviceWatcher()
 	// Use the A2DP sink device selector so the watcher surfaces exactly the
 	// devices that AudioPlaybackConnection can use.
 	auto selector = AudioPlaybackConnection::GetDeviceSelector();
-	g_deviceWatcher = DeviceInformation::CreateWatcher(selector);
+
+	// Request the battery-level property so we can display it in the UI.
+	// DEVPKEY_Device_BatteryLevel = {104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2
+	auto additionalProperties = winrt::single_threaded_vector<winrt::hstring>({
+		L"{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2"
+	});
+	g_deviceWatcher = DeviceInformation::CreateWatcher(selector, additionalProperties);
 
 	g_deviceWatcher.Added([](const auto&, const DeviceInformation& device) {
 		g_availableDevices.emplace(std::wstring(device.Id()), device);
@@ -722,7 +844,8 @@ void UpdateNotifyIcon()
 	// Update tooltip with the first connected / connecting device name
 	if (hasConnection)
 	{
-		const auto& name = g_audioPlaybackConnections.begin()->second.first.Name();
+		auto connIt = g_audioPlaybackConnections.begin();
+		auto name = GetDeviceDisplayName(connIt->first, connIt->second.first.Name());
 		const size_t numDevices = g_audioPlaybackConnections.size();
 		if (numDevices == 1)
 			swprintf_s(g_nid.szTip, L"BTAudio - %s", name.c_str());
@@ -731,7 +854,9 @@ void UpdateNotifyIcon()
 	}
 	else if (isConnecting)
 	{
-		swprintf_s(g_nid.szTip, L"BTAudio - %s", g_connectingDevices.begin()->second.c_str());
+		auto connIt = g_connectingDevices.begin();
+		auto name = GetDeviceDisplayName(connIt->first, connIt->second);
+		swprintf_s(g_nid.szTip, L"BTAudio - %s", name.c_str());
 	}
 	else
 	{
@@ -1052,20 +1177,43 @@ void RefreshDeviceList()
 				const auto& device = pair.first;
 
 				TextBlock nameText;
-				nameText.Text(device.Name());
+				nameText.Text(GetDeviceDisplayName(id, device.Name()));
 				nameText.FontSize(13);
 				nameText.VerticalAlignment(VerticalAlignment::Center);
 				nameText.TextTrimming(TextTrimming::CharacterEllipsis);
 
+				// Build status text, appending battery level if available.
+				std::wstring statusStr = _(L"Connected");
+				int battery = GetDeviceBatteryLevel(id);
+				if (battery >= 0)
+					statusStr += L" | " + std::to_wstring(battery) + L"%";
+
 				TextBlock statusText;
-				statusText.Text(_(L"Connected"));
+				statusText.Text(statusStr);
 				statusText.FontSize(11);
 				statusText.Foreground(SolidColorBrush(Colors::Green()));
 				statusText.VerticalAlignment(VerticalAlignment::Center);
 				statusText.Margin({ 8, 0, 0, 0 });
 
-			Button reconnectButton;
-			reconnectButton.Content(winrt::box_value(L"\xE72C")); // Refresh icon
+		Button renameButton;
+		renameButton.Content(winrt::box_value(L"\xE70F")); // Edit icon
+		renameButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+		renameButton.FontSize(10);
+		renameButton.Padding(ThicknessHelper::FromUniformLength(0));
+		renameButton.MinWidth(28);
+		renameButton.MinHeight(28);
+		renameButton.Width(28);
+		renameButton.Height(28);
+		renameButton.Margin({ 4, 0, 0, 0 });
+		renameButton.HorizontalContentAlignment(HorizontalAlignment::Center);
+		renameButton.VerticalContentAlignment(VerticalAlignment::Center);
+		renameButton.Background(SolidColorBrush(Colors::Transparent()));
+		renameButton.Foreground(SolidColorBrush(Colors::Gray()));
+		renameButton.VerticalAlignment(VerticalAlignment::Center);
+		ToolTipService::SetToolTip(renameButton, winrt::box_value(_(L"Rename")));
+
+		Button reconnectButton;
+		reconnectButton.Content(winrt::box_value(L"\xE72C")); // Refresh icon
 			reconnectButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
 			reconnectButton.FontSize(10);
 			reconnectButton.Padding(ThicknessHelper::FromUniformLength(0));
@@ -1098,8 +1246,17 @@ void RefreshDeviceList()
 			disconnectButton.VerticalAlignment(VerticalAlignment::Center);
 			ToolTipService::SetToolTip(disconnectButton, winrt::box_value(_(L"Disconnect")));
 
-			std::wstring deviceId(id);
-			reconnectButton.Click([deviceId](const auto&, const auto&) {
+		std::wstring deviceId(id);
+		renameButton.Click([deviceId](const auto& sender, const auto&) {
+			g_renamingDeviceId = deviceId;
+			auto aliasIt = g_deviceAliases.find(deviceId);
+			if (aliasIt != g_deviceAliases.end())
+				g_renameTextBox.Text(aliasIt->second);
+			else
+				g_renameTextBox.Text(L"");
+			g_renameFlyout.ShowAt(sender.template as<FrameworkElement>());
+		});
+		reconnectButton.Click([deviceId](const auto&, const auto&) {
 				auto it = g_audioPlaybackConnections.find(deviceId);
 				if (it != g_audioPlaybackConnections.end())
 				{
@@ -1120,7 +1277,7 @@ void RefreshDeviceList()
 				auto it = g_audioPlaybackConnections.find(deviceId);
 				if (it != g_audioPlaybackConnections.end())
 				{
-				std::wstring deviceName(it->second.first.Name());
+				std::wstring deviceName(GetDeviceDisplayName(deviceId, it->second.first.Name()));
 				it->second.second.Close();
 				g_audioPlaybackConnections.erase(it);
 				ShowNotification(deviceName, _(L"Disconnected"), NIIF_INFO);
@@ -1129,27 +1286,32 @@ void RefreshDeviceList()
 				}
 			});
 
-			Grid deviceGrid;
-			ColumnDefinition deviceCol0;
-			deviceCol0.Width(GridLength(1, GridUnitType::Star));
-			ColumnDefinition deviceCol1;
-			deviceCol1.Width(GridLength(1, GridUnitType::Auto));
-			ColumnDefinition deviceCol2;
-			deviceCol2.Width(GridLength(1, GridUnitType::Auto));
-			ColumnDefinition deviceCol3;
-			deviceCol3.Width(GridLength(1, GridUnitType::Auto));
-			deviceGrid.ColumnDefinitions().Append(deviceCol0);
-			deviceGrid.ColumnDefinitions().Append(deviceCol1);
-			deviceGrid.ColumnDefinitions().Append(deviceCol2);
-			deviceGrid.ColumnDefinitions().Append(deviceCol3);
-			deviceGrid.Children().Append(nameText);
-			deviceGrid.Children().Append(statusText);
-			deviceGrid.Children().Append(reconnectButton);
-			deviceGrid.Children().Append(disconnectButton);
-			Grid::SetColumn(nameText, 0);
-			Grid::SetColumn(statusText, 1);
-			Grid::SetColumn(reconnectButton, 2);
-			Grid::SetColumn(disconnectButton, 3);
+		Grid deviceGrid;
+		ColumnDefinition deviceCol0;
+		deviceCol0.Width(GridLength(1, GridUnitType::Star));
+		ColumnDefinition deviceCol1;
+		deviceCol1.Width(GridLength(1, GridUnitType::Auto));
+		ColumnDefinition deviceCol2;
+		deviceCol2.Width(GridLength(1, GridUnitType::Auto));
+		ColumnDefinition deviceCol3;
+		deviceCol3.Width(GridLength(1, GridUnitType::Auto));
+		ColumnDefinition deviceCol4;
+		deviceCol4.Width(GridLength(1, GridUnitType::Auto));
+		deviceGrid.ColumnDefinitions().Append(deviceCol0);
+		deviceGrid.ColumnDefinitions().Append(deviceCol1);
+		deviceGrid.ColumnDefinitions().Append(deviceCol2);
+		deviceGrid.ColumnDefinitions().Append(deviceCol3);
+		deviceGrid.ColumnDefinitions().Append(deviceCol4);
+		deviceGrid.Children().Append(nameText);
+		deviceGrid.Children().Append(statusText);
+		deviceGrid.Children().Append(renameButton);
+		deviceGrid.Children().Append(reconnectButton);
+		deviceGrid.Children().Append(disconnectButton);
+		Grid::SetColumn(nameText, 0);
+		Grid::SetColumn(statusText, 1);
+		Grid::SetColumn(renameButton, 2);
+		Grid::SetColumn(reconnectButton, 3);
+		Grid::SetColumn(disconnectButton, 4);
 
 				Border deviceCard;
 				deviceCard.Child(deviceGrid);
@@ -1181,10 +1343,27 @@ void RefreshDeviceList()
 			any = true;
 
 			TextBlock nameText;
-			nameText.Text(device.Name());
+			nameText.Text(GetDeviceDisplayName(id, device.Name()));
 			nameText.FontSize(13);
 			nameText.VerticalAlignment(VerticalAlignment::Center);
 			nameText.TextTrimming(TextTrimming::CharacterEllipsis);
+
+			Button renameButton;
+			renameButton.Content(winrt::box_value(L"\xE70F")); // Edit icon
+			renameButton.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+			renameButton.FontSize(10);
+			renameButton.Padding(ThicknessHelper::FromUniformLength(0));
+			renameButton.MinWidth(28);
+			renameButton.MinHeight(28);
+			renameButton.Width(28);
+			renameButton.Height(28);
+			renameButton.Margin({ 4, 0, 0, 0 });
+			renameButton.HorizontalContentAlignment(HorizontalAlignment::Center);
+			renameButton.VerticalContentAlignment(VerticalAlignment::Center);
+			renameButton.Background(SolidColorBrush(Colors::Transparent()));
+			renameButton.Foreground(SolidColorBrush(Colors::Gray()));
+			renameButton.VerticalAlignment(VerticalAlignment::Center);
+			ToolTipService::SetToolTip(renameButton, winrt::box_value(_(L"Rename")));
 
 			Button connectButton;
 			connectButton.Content(winrt::box_value(_(L"Connect")));
@@ -1195,6 +1374,15 @@ void RefreshDeviceList()
 			connectButton.VerticalAlignment(VerticalAlignment::Center);
 
 			std::wstring deviceId(id);
+			renameButton.Click([deviceId](const auto& sender, const auto&) {
+				g_renamingDeviceId = deviceId;
+				auto aliasIt = g_deviceAliases.find(deviceId);
+				if (aliasIt != g_deviceAliases.end())
+					g_renameTextBox.Text(aliasIt->second);
+				else
+					g_renameTextBox.Text(L"");
+				g_renameFlyout.ShowAt(sender.template as<FrameworkElement>());
+			});
 			connectButton.Click([deviceId](const auto&, const auto&) {
 				ConnectDevice(deviceId);
 			});
@@ -1204,12 +1392,17 @@ void RefreshDeviceList()
 			availCol0.Width(GridLength(1, GridUnitType::Star));
 			ColumnDefinition availCol1;
 			availCol1.Width(GridLength(1, GridUnitType::Auto));
+			ColumnDefinition availCol2;
+			availCol2.Width(GridLength(1, GridUnitType::Auto));
 			availGrid.ColumnDefinitions().Append(availCol0);
 			availGrid.ColumnDefinitions().Append(availCol1);
+			availGrid.ColumnDefinitions().Append(availCol2);
 			availGrid.Children().Append(nameText);
+			availGrid.Children().Append(renameButton);
 			availGrid.Children().Append(connectButton);
 			Grid::SetColumn(nameText, 0);
-			Grid::SetColumn(connectButton, 1);
+			Grid::SetColumn(renameButton, 1);
+			Grid::SetColumn(connectButton, 2);
 
 			Border availCard;
 			availCard.Child(availGrid);
@@ -1228,7 +1421,7 @@ void RefreshDeviceList()
 			any = true;
 
 			TextBlock nameText;
-			nameText.Text(name);
+			nameText.Text(GetDeviceDisplayName(id, name));
 			nameText.FontSize(13);
 			nameText.VerticalAlignment(VerticalAlignment::Center);
 			nameText.TextTrimming(TextTrimming::CharacterEllipsis);

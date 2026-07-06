@@ -17,10 +17,34 @@ constexpr UINT WM_REFRESHDEVICELIST = WM_APP + 3;
 constexpr UINT WM_UPDATEAVAILABLE = WM_APP + 4;
 constexpr UINT WM_UPTODATE = WM_APP + 5;
 constexpr UINT WM_UPDATEFAILED = WM_APP + 6;
+// Posted by the AudioPlaybackConnection.StateChanged callback to signal that a
+// connection transitioned to Closed. The callback may fire on an arbitrary
+// thread, so it only forwards the device id (heap-allocated) here and all map
+// bookkeeping is performed on the UI thread. WPARAM owns a std::wstring*.
+constexpr UINT WM_DEVICECLOSED = WM_APP + 7;
+// Posted by the DeviceWatcher.Added callback so the UI thread can reconcile
+// the set of devices that were out-of-range at startup (g_pendingConnectOnAppear)
+// against what the watcher has now found, and queue any newly-available ones
+// for a serial startup reconnect.
+constexpr UINT WM_DEVICEAPPEARED = WM_APP + 8;
+// Posted to pump the next item out of g_connectQueue so startup reconnects are
+// issued one at a time (serial) rather than firing concurrently and competing
+// for the Bluetooth radio.
+constexpr UINT WM_CONNECTNEXT = WM_APP + 9;
 
-// Timer ID for the startup-delay reconnect (gives Bluetooth services time to
-// initialize before attempting to reconnect, especially when auto-starting).
+// Initial delay before the startup reconnect. Kept short: devices that are not
+// yet enumerated by the DeviceWatcher are recorded in g_pendingConnectOnAppear
+// and connected lazily when WM_DEVICEAPPEARED reports them, so a fixed long
+// delay is no longer needed just to "wait for the radio".
 constexpr UINT_PTR IDT_STARTUP_DELAY = 1001;
+constexpr UINT STARTUP_DELAY_MS = 1500;
+
+// Retry budgets. Manual connections retry a couple of times with short
+// backoff; automatic (link-drop) reconnects retry more aggressively over a
+// longer window with exponential backoff so a briefly-out-of-range device has
+// time to come back.
+constexpr int MANUAL_RETRY_COUNT = 2;
+constexpr int AUTO_RECONNECT_RETRY_COUNT = 8;
 
 HINSTANCE g_hInst;
 HWND g_hWnd;
@@ -44,9 +68,26 @@ std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConne
 struct PendingReconnect
 {
 	std::wstring deviceId;
-	int retryCount;
+	int retryCount;              // remaining attempts after the scheduled one
+	int attempt;                 // index of the scheduled attempt (0-based) — drives backoff
+	bool isAutoReconnect;        // true => link-drop auto-reconnect (slower backoff, more tries)
+	bool notifyNextOnComplete;   // true => PostMessage(WM_CONNECTNEXT) when this attempt chain ends
 };
 std::map<UINT_PTR, PendingReconnect> g_pendingReconnects;
+// Device ids from g_lastDevices that were out-of-range when the startup
+// reconnect ran. When the DeviceWatcher later reports them (Added), they are
+// promoted into g_connectQueue. This implements P2(六): don't waste the manual
+// retry budget on devices that aren't currently reachable.
+std::set<std::wstring> g_pendingConnectOnAppear;
+// FIFO of device ids awaiting a serial startup connect. Pumped by
+// WM_CONNECTNEXT; ConnectDevice(notifyNextOnComplete=true) posts WM_CONNECTNEXT
+// once its attempt chain finishes (success or final failure), so connects are
+// issued one at a time.
+std::deque<std::wstring> g_connectQueue;
+// True while a serial (startup) connect is in flight. Guards against
+// WM_CONNECTNEXT / HandleDeviceAppeared starting a second concurrent connect
+// when the queue was momentarily empty after a pop.
+bool g_connectInProgress = false;
 // Tray icons for different connection states. Each pair has a light-theme and
 // dark-theme variant, rendered from the SVG resource with a state-specific colour.
 HICON g_hIconLight = nullptr;          // normal — no device connected
@@ -103,6 +144,17 @@ void SetupRenameFlyout();
 std::wstring GetDeviceDisplayName(const std::wstring& deviceId, std::wstring_view defaultName);
 int GetDeviceBatteryLevel(const std::wstring& deviceId);
 VOID CALLBACK StartupDelayTimerProc(HWND, UINT, UINT_PTR, DWORD);
+// Compute the backoff delay (ms) before the next reconnect attempt.
+// attempt is the 0-based index of the upcoming attempt. Auto-reconnect uses a
+// gentler exponential curve with a higher cap than a manual connect retry.
+UINT ComputeReconnectDelay(int attempt, bool isAutoReconnect);
+// Handle a Closed notification that was posted from the StateChanged callback.
+// Decides whether the close was a user-initiated teardown (ignored) or an
+// unexpected link drop (erases the stale connection and kicks off auto-reconnect).
+void HandleDeviceClosed(const std::wstring& deviceId);
+// Reconcile g_pendingConnectOnAppear against the devices the DeviceWatcher has
+// now found: move any that have appeared into g_connectQueue and pump it.
+void HandleDeviceAppeared();
 
 #include "Util.hpp"
 #include "I18n.hpp"

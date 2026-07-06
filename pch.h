@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <unordered_map>
 #include <map>
+#include <set>
+#include <deque>
 #include <filesystem>
 
 // wil

@@ -43,8 +43,15 @@ struct PendingReconnect
 	int retryCount;
 };
 std::map<UINT_PTR, PendingReconnect> g_pendingReconnects;
-HICON g_hIconLight = nullptr;
+// Tray icons for different connection states. Each pair has a light-theme and
+// dark-theme variant, rendered from the SVG resource with a state-specific colour.
+HICON g_hIconLight = nullptr;          // normal — no device connected
 HICON g_hIconDark = nullptr;
+HICON g_hIconLightConnecting = nullptr; // connecting — amber
+HICON g_hIconDarkConnecting = nullptr;
+HICON g_hIconLightConnected = nullptr;  // connected  — green
+HICON g_hIconDarkConnected = nullptr;
+
 NOTIFYICONDATAW g_nid = {
 	.cbSize = sizeof(g_nid),
 	.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
@@ -56,6 +63,7 @@ NOTIFYICONIDENTIFIER g_niid = {
 };
 UINT WM_TASKBAR_CREATED = 0;
 bool g_reconnect = false;
+bool g_autoStart = false;
 std::vector<std::wstring> g_lastDevices;
 
 // Main window
@@ -72,6 +80,13 @@ Flyout g_updateFlyout = nullptr;
 // Settings flyout (BTAudio program settings)
 Flyout g_settingsFlyout = nullptr;
 CheckBox g_settingsReconnectCheckbox = nullptr;
+CheckBox g_settingsAutoStartCheckbox = nullptr;
+
+// Forward declarations — must appear before the .hpp includes so that
+// settings / utility helpers can call these functions.
+void ShowNotification(const std::wstring& title, const std::wstring& message, DWORD dwInfoFlags = NIIF_INFO);
+bool IsAutoStartEnabled();
+void SetAutoStart(bool enable);
 
 #include "Util.hpp"
 #include "I18n.hpp"

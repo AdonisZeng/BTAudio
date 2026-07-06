@@ -6,6 +6,7 @@ constexpr auto BUFFER_SIZE = 4096;
 void DefaultSettings()
 {
 	g_reconnect = false;
+	g_autoStart = false;
 	g_lastDevices.clear();
 }
 
@@ -34,6 +35,13 @@ void LoadSettings()
 		auto jsonObj = JsonObject::Parse(utf16);
 		g_reconnect = jsonObj.Lookup(L"reconnect").GetBoolean();
 
+		// Read auto-start preference; if the key is missing (upgrade from an
+		// older settings file), detect the current state from the registry.
+		if (jsonObj.HasKey(L"autoStart"))
+			g_autoStart = jsonObj.Lookup(L"autoStart").GetBoolean();
+		else
+			g_autoStart = IsAutoStartEnabled();
+
 		auto lastDevices = jsonObj.Lookup(L"lastDevices").GetArray();
 		g_lastDevices.reserve(lastDevices.Size());
 		for (const auto& i : lastDevices)
@@ -51,6 +59,7 @@ void SaveSettings()
 	{
 		JsonObject jsonObj;
 		jsonObj.Insert(L"reconnect", JsonValue::CreateBooleanValue(g_reconnect));
+		jsonObj.Insert(L"autoStart", JsonValue::CreateBooleanValue(g_autoStart));
 
 		JsonArray lastDevices;
 		for (const auto& i : g_audioPlaybackConnections)

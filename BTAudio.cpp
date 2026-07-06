@@ -17,6 +17,65 @@ void HideMainWindow();
 void RefreshDeviceList();
 void ShowUpdateDialog();
 
+// ---------------------------------------------------------------------------
+// Pop a balloon / action-centre notification through the tray icon.
+// ---------------------------------------------------------------------------
+void ShowNotification(const std::wstring& title, const std::wstring& message, DWORD dwInfoFlags)
+{
+	NOTIFYICONDATAW nidCopy = g_nid;
+	nidCopy.uFlags |= NIF_INFO;
+	nidCopy.dwInfoFlags = dwInfoFlags;
+	wcsncpy_s(nidCopy.szInfoTitle, 64, title.c_str(), _TRUNCATE);
+	wcsncpy_s(nidCopy.szInfo, 256, message.c_str(), _TRUNCATE);
+	Shell_NotifyIconW(NIM_MODIFY, &nidCopy);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-start via HKCU\...\Run — read / write the registry value "BTAudio".
+// ---------------------------------------------------------------------------
+bool IsAutoStartEnabled()
+{
+	HKEY hKey;
+	if (RegOpenKeyExW(HKEY_CURRENT_USER,
+		L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+		0, KEY_READ, &hKey) == ERROR_SUCCESS)
+	{
+		wchar_t path[MAX_PATH] = {};
+		DWORD size = sizeof(path);
+		if (RegQueryValueExW(hKey, L"BTAudio", nullptr, nullptr,
+			reinterpret_cast<LPBYTE>(path), &size) == ERROR_SUCCESS)
+		{
+			RegCloseKey(hKey);
+			auto exePath = GetModuleFsPath(g_hInst).wstring();
+			return _wcsicmp(path, exePath.c_str()) == 0;
+		}
+		RegCloseKey(hKey);
+	}
+	return false;
+}
+
+void SetAutoStart(bool enable)
+{
+	HKEY hKey;
+	if (RegOpenKeyExW(HKEY_CURRENT_USER,
+		L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+		0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS)
+	{
+		if (enable)
+		{
+			auto exePath = GetModuleFsPath(g_hInst).wstring();
+			RegSetValueExW(hKey, L"BTAudio", 0, REG_SZ,
+				reinterpret_cast<const BYTE*>(exePath.c_str()),
+				static_cast<DWORD>((exePath.size() + 1) * sizeof(wchar_t)));
+		}
+		else
+		{
+			RegDeleteValueW(hKey, L"BTAudio");
+		}
+		RegCloseKey(hKey);
+	}
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
 	_In_ LPWSTR    lpCmdLine,
@@ -75,6 +134,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	desktopSource.Content(g_xamlCanvas);
 
 	LoadSettings();
+	// Immediately sync the auto-start setting with the registry so that the
+	// Run key is always consistent with the persisted preference.
+	SetAutoStart(g_autoStart);
 	SetupFlyout();
 	SetupMenu();
 	SetupSettingsFlyout();
@@ -130,6 +192,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			SaveSettings();
 		}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
+		// Clean up all icon handles
+		if (g_hIconLight)               DestroyIcon(g_hIconLight);
+		if (g_hIconDark)                DestroyIcon(g_hIconDark);
+		if (g_hIconLightConnecting)     DestroyIcon(g_hIconLightConnecting);
+		if (g_hIconDarkConnecting)      DestroyIcon(g_hIconDarkConnecting);
+		if (g_hIconLightConnected)      DestroyIcon(g_hIconLightConnected);
+		if (g_hIconDarkConnected)       DestroyIcon(g_hIconDarkConnected);
 		PostQuitMessage(0);
 		break;
 	case WM_SETTINGCHANGE:
@@ -249,6 +318,16 @@ void SetupSettingsFlyout()
 		SaveSettings();
 	});
 
+	g_settingsAutoStartCheckbox = CheckBox();
+	g_settingsAutoStartCheckbox.IsChecked(g_autoStart);
+	g_settingsAutoStartCheckbox.Content(winrt::box_value(_(L"Start with Windows")));
+	g_settingsAutoStartCheckbox.Margin({ 0, 0, 0, 12 });
+	g_settingsAutoStartCheckbox.Click([](const auto&, const auto&) {
+		g_autoStart = g_settingsAutoStartCheckbox.IsChecked().Value();
+		SetAutoStart(g_autoStart);
+		SaveSettings();
+	});
+
 	Button closeButton;
 	closeButton.Content(winrt::box_value(_(L"Done")));
 	closeButton.HorizontalAlignment(HorizontalAlignment::Right);
@@ -261,6 +340,7 @@ void SetupSettingsFlyout()
 	panel.Width(280);
 	panel.Children().Append(title);
 	panel.Children().Append(g_settingsReconnectCheckbox);
+	panel.Children().Append(g_settingsAutoStartCheckbox);
 	panel.Children().Append(closeButton);
 
 	Flyout flyout;
@@ -396,16 +476,18 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount)
 			connection.StateChanged([](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
 				{
-					auto it = g_audioPlaybackConnections.find(std::wstring(sender.DeviceId()));
+					std::wstring deviceId(sender.DeviceId());
+					std::wstring deviceName;
+					auto it = g_audioPlaybackConnections.find(deviceId);
 					if (it != g_audioPlaybackConnections.end())
 					{
+						deviceName = it->second.first.Name();
 						g_audioPlaybackConnections.erase(it);
 					}
-					g_connectingDevices.erase(std::wstring(sender.DeviceId()));
+					g_connectingDevices.erase(deviceId);
 					PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
-					// Do not call sender.Close() here. The connection is already in the
-					// Closed state and the map entry has been erased, so calling Close()
-					// again is redundant and risks reentrancy within the event callback.
+					if (!deviceName.empty())
+						ShowNotification(deviceName, _(L"Disconnected"), NIIF_INFO);
 				}
 			});
 
@@ -493,12 +575,19 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount)
 			if (UINT_PTR timerId = SetTimer(g_hWnd, 0, 500, ReconnectTimerProc))
 				g_pendingReconnects[timerId] = { deviceId, retryCount - 1 };
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+			UpdateNotifyIcon();
 			co_return;
 		}
-		// TODO: errorMessage is currently discarded. A future enhancement could
-		// surface it inline in the available-device card. For now we just refresh.
+		// Surface failure via toast notification so the user is aware.
+		ShowNotification(deviceName, errorMessage, NIIF_ERROR);
+	}
+	else
+	{
+		// Connection succeeded — notify the user.
+		ShowNotification(deviceName, _(L"Connected successfully"), NIIF_INFO);
 	}
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+	UpdateNotifyIcon();
 }
 
 winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount)
@@ -517,6 +606,7 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount)
 		LOG_CAUGHT_EXCEPTION();
 		g_connectingDevices.erase(deviceId);
 		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+		UpdateNotifyIcon();
 	}
 }
 
@@ -564,8 +654,17 @@ void SetupSvgIcon()
 	const std::string_view svg(svgData, size);
 	const int width = GetSystemMetrics(SM_CXSMICON), height = GetSystemMetrics(SM_CYSMICON);
 
+	// Normal state – black for light theme, white for dark
 	g_hIconLight = SvgTohIcon(svg, width, height, { 0, 0, 0, 1 });
 	g_hIconDark = SvgTohIcon(svg, width, height, { 1, 1, 1, 1 });
+
+	// Connecting state – amber / yellow-orange
+	g_hIconLightConnecting = SvgTohIcon(svg, width, height, { 0.85f, 0.55f, 0.0f, 1 });
+	g_hIconDarkConnecting  = SvgTohIcon(svg, width, height, { 1.0f, 0.7f, 0.1f, 1 });
+
+	// Connected state – green
+	g_hIconLightConnected = SvgTohIcon(svg, width, height, { 0.1f, 0.65f, 0.2f, 1 });
+	g_hIconDarkConnected  = SvgTohIcon(svg, width, height, { 0.3f, 0.85f, 0.3f, 1 });
 }
 
 bool IsSystemLightTheme()
@@ -608,7 +707,36 @@ void ApplyTheme()
 
 void UpdateNotifyIcon()
 {
-	g_nid.hIcon = IsSystemLightTheme() ? g_hIconLight : g_hIconDark;
+	const bool isLight = IsSystemLightTheme();
+	const bool hasConnection = !g_audioPlaybackConnections.empty();
+	const bool isConnecting = !g_connectingDevices.empty();
+
+	// Choose icon by priority: connected > connecting > normal
+	if (hasConnection)
+		g_nid.hIcon = isLight ? g_hIconLightConnected : g_hIconDarkConnected;
+	else if (isConnecting)
+		g_nid.hIcon = isLight ? g_hIconLightConnecting : g_hIconDarkConnecting;
+	else
+		g_nid.hIcon = isLight ? g_hIconLight : g_hIconDark;
+
+	// Update tooltip with the first connected / connecting device name
+	if (hasConnection)
+	{
+		const auto& name = g_audioPlaybackConnections.begin()->second.first.Name();
+		const size_t numDevices = g_audioPlaybackConnections.size();
+		if (numDevices == 1)
+			swprintf_s(g_nid.szTip, L"BTAudio - %s", name.c_str());
+		else
+			swprintf_s(g_nid.szTip, L"BTAudio - %s +%zu", name.c_str(), numDevices - 1);
+	}
+	else if (isConnecting)
+	{
+		swprintf_s(g_nid.szTip, L"BTAudio - %s", g_connectingDevices.begin()->second.c_str());
+	}
+	else
+	{
+		wcscpy_s(g_nid.szTip, L"BTAudio");
+	}
 
 	if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid))
 	{
@@ -736,6 +864,8 @@ void SetupMainWindow()
 		// Sync checkbox with current value before showing
 		if (g_settingsReconnectCheckbox)
 			g_settingsReconnectCheckbox.IsChecked(g_reconnect);
+		if (g_settingsAutoStartCheckbox)
+			g_settingsAutoStartCheckbox.IsChecked(g_autoStart);
 		g_settingsFlyout.ShowAt(sender.template as<FrameworkElement>());
 	});
 
@@ -982,6 +1112,7 @@ void RefreshDeviceList()
 					it->second.second.Close();
 					g_audioPlaybackConnections.erase(it);
 					PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+					UpdateNotifyIcon();
 					ConnectDevice(device, 2);
 				}
 			});
@@ -989,9 +1120,12 @@ void RefreshDeviceList()
 				auto it = g_audioPlaybackConnections.find(deviceId);
 				if (it != g_audioPlaybackConnections.end())
 				{
-					it->second.second.Close();
-					g_audioPlaybackConnections.erase(it);
-					PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+				std::wstring deviceName(it->second.first.Name());
+				it->second.second.Close();
+				g_audioPlaybackConnections.erase(it);
+				ShowNotification(deviceName, _(L"Disconnected"), NIIF_INFO);
+				PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+					UpdateNotifyIcon();
 				}
 			});
 
@@ -1146,6 +1280,9 @@ void RefreshDeviceList()
 			g_mainAvailableListPanel.Children().Append(g_mainNoAvailableText);
 		}
 	}
+
+	// Keep the tray icon in sync with the current connection state.
+	UpdateNotifyIcon();
 }
 
 void ShowUpdateDialog()

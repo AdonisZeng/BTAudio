@@ -5,8 +5,8 @@ LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
 void SetupSettingsFlyout();
-winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false);
-winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false);
+winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
 void SetupDeviceWatcher();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
@@ -20,19 +20,6 @@ void SetupRenameFlyout();
 std::wstring GetDeviceDisplayName(const std::wstring& deviceId, std::wstring_view defaultName);
 int GetDeviceBatteryLevel(const std::wstring& deviceId);
 VOID CALLBACK StartupDelayTimerProc(HWND, UINT, UINT_PTR, DWORD);
-
-// ---------------------------------------------------------------------------
-// Pop a balloon / action-centre notification through the tray icon.
-// ---------------------------------------------------------------------------
-void ShowNotification(const std::wstring& title, const std::wstring& message, DWORD dwInfoFlags)
-{
-	NOTIFYICONDATAW nidCopy = g_nid;
-	nidCopy.uFlags |= NIF_INFO;
-	nidCopy.dwInfoFlags = dwInfoFlags;
-	wcsncpy_s(nidCopy.szInfoTitle, 64, title.c_str(), _TRUNCATE);
-	wcsncpy_s(nidCopy.szInfo, 256, message.c_str(), _TRUNCATE);
-	Shell_NotifyIconW(NIM_MODIFY, &nidCopy);
-}
 
 // ---------------------------------------------------------------------------
 // Auto-start via HKCU\...\Run — read / write the registry value "BTAudio".
@@ -319,6 +306,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					g_pendingConnectOnAppear.insert(i);
 			}
 			g_lastDevices.clear();
+			// Start a timeout for devices pending on appear so we don't wait
+			// forever for a device that never comes back in range.
+			if (!g_pendingConnectOnAppear.empty())
+				SetTimer(g_hWnd, IDT_PENDING_APPEAR_TIMEOUT, PENDING_APPEAR_TIMEOUT_MS, PendingAppearTimeoutTimerProc);
 			// Start the serial pump. WM_CONNECTNEXT will issue one ConnectDevice
 			// at a time and chain to the next when each finishes.
 			PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
@@ -598,7 +589,7 @@ VOID CALLBACK ReconnectTimerProc(HWND hwnd, UINT, UINT_PTR idEvent, DWORD)
 		// deviceId is moved into the coroutine frame (passed by value), so it is
 		// safe across the suspension points inside ConnectDevice even though this
 		// stack frame returns immediately afterwards.
-		ConnectDevice(std::move(pr.deviceId), pr.retryCount, pr.attempt, pr.isAutoReconnect, pr.notifyNextOnComplete);
+		ConnectDevice(std::move(pr.deviceId), pr.retryCount, pr.attempt, pr.isAutoReconnect, pr.notifyNextOnComplete, pr.autoReconnectDeadline);
 	}
 }
 
@@ -636,7 +627,7 @@ UINT ComputeReconnectDelay(int attempt, bool isAutoReconnect)
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete)
+winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
 {
 	const std::wstring deviceId(device.Id());
 	const std::wstring deviceName(device.Name());
@@ -770,25 +761,55 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 		// single-threaded. Auto-reconnect uses a gentler curve than manual.
 		if (shouldRetry && retryCount > 0)
 		{
+			// Check if auto-reconnect was cancelled by the user while we were
+			// awaiting the async operation.
+			if (isAutoReconnect && g_autoReconnectingDevices.find(deviceId) == g_autoReconnectingDevices.end())
+			{
+				if (notifyNextOnComplete)
+				{
+					g_connectInProgress = false;
+					PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
+				}
+				PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+				UpdateNotifyIcon();
+				co_return;
+			}
+			// Check if the auto-reconnect wall-clock timeout has been exceeded.
+			if (isAutoReconnect && autoReconnectDeadline > 0 && GetTickCount64() >= autoReconnectDeadline)
+			{
+				g_autoReconnectingDevices.erase(deviceId);
+				if (notifyNextOnComplete)
+				{
+					g_connectInProgress = false;
+					PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
+				}
+				PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+				UpdateNotifyIcon();
+				co_return;
+			}
 			const int nextAttempt = attempt + 1;
 			const UINT delay = ComputeReconnectDelay(nextAttempt, isAutoReconnect);
 			// Keep showing the "Connecting" state while we wait out the backoff.
 			g_connectingDevices.emplace(deviceId, deviceName);
 			if (UINT_PTR timerId = SetTimer(g_hWnd, 0, delay, ReconnectTimerProc))
-				g_pendingReconnects[timerId] = { deviceId, retryCount - 1, nextAttempt, isAutoReconnect, notifyNextOnComplete };
+				g_pendingReconnects[timerId] = { deviceId, retryCount - 1, nextAttempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline };
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 			UpdateNotifyIcon();
 			co_return;
 		}
-		// Surface failure via toast notification so the user is aware.
-		ShowNotification(displayName, errorMessage, NIIF_ERROR);
+		// Auto-reconnect chain ended without success (exhausted retries or
+		// non-retryable failure). Clear the tracking so the UI drops the
+		// "Cancel" button.
+		if (isAutoReconnect)
+			g_autoReconnectingDevices.erase(deviceId);
 	}
 	else
 	{
-		// Connection succeeded — notify the user and persist the updated device
-		// list immediately (P1: incremental save) so a crash/forced-exit does
-		// not lose the freshly-established connection.
-		ShowNotification(displayName, _(L"Connected successfully"), NIIF_INFO);
+		// Connection succeeded — persist the updated device list immediately
+		// (P1: incremental save) so a crash/forced-exit does not lose the
+		// freshly-established connection.
+		if (isAutoReconnect)
+			g_autoReconnectingDevices.erase(deviceId);
 		SaveSettings();
 	}
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
@@ -803,14 +824,14 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete)
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
 {
 	// deviceId is owned by the coroutine frame (passed by value), so it remains
 	// valid across the suspension point below.
 	try
 	{
 		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
-		ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete);
+		ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline);
 	}
 	catch (winrt::hresult_error const&)
 	{
@@ -818,6 +839,8 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int 
 		// it; silently drop the retry and refresh the UI.
 		LOG_CAUGHT_EXCEPTION();
 		g_connectingDevices.erase(deviceId);
+		if (isAutoReconnect)
+			g_autoReconnectingDevices.erase(deviceId);
 		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 		UpdateNotifyIcon();
 		// This attempt chain ends here; chain to the next queued connect so the
@@ -854,12 +877,16 @@ void HandleDeviceClosed(const std::wstring& deviceId)
 	UpdateNotifyIcon();
 
 	if (!deviceName.empty())
-		ShowNotification(deviceName, _(L"Disconnected"), NIIF_INFO);
-
-	// Kick off an automatic reconnect with a larger retry budget and gentler
-	// exponential backoff so a briefly-out-of-range / sleeping device gets a
-	// chance to come back without user intervention.
-	ConnectDevice(deviceId, AUTO_RECONNECT_RETRY_COUNT, 0, true);
+	{
+		// Kick off an automatic reconnect with a larger retry budget and gentler
+		// exponential backoff so a briefly-out-of-range / sleeping device gets a
+		// chance to come back without user intervention. The wall-clock deadline
+		// caps the entire chain so a permanently-unreachable device doesn't keep
+		// the tray icon amber indefinitely.
+		g_autoReconnectingDevices.insert(deviceId);
+		ConnectDevice(deviceId, AUTO_RECONNECT_RETRY_COUNT, 0, true, false,
+			GetTickCount64() + AUTO_RECONNECT_TIMEOUT_MS);
+	}
 }
 
 // Reconcile g_pendingConnectOnAppear against the devices the watcher has now
@@ -892,6 +919,49 @@ void HandleDeviceAppeared()
 	// newly-queued devices. This preserves strict serial ordering.
 	if (!g_connectInProgress)
 		PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Cancel an in-progress auto-reconnect for a device. Kills any pending retry
+// timer, clears the connecting / auto-reconnect tracking, and refreshes the
+// UI so the device reappears in the available list with a Connect button.
+//
+// Note: if a ConnectDevice coroutine is currently awaiting StartAsync/OpenAsync,
+// the cancellation is detected when that async call returns — the coroutine
+// checks g_autoReconnectingDevices before scheduling the next retry.
+// ---------------------------------------------------------------------------
+void CancelReconnect(const std::wstring& deviceId)
+{
+	// Kill any pending reconnect timer for this device.
+	for (auto it = g_pendingReconnects.begin(); it != g_pendingReconnects.end(); )
+	{
+		if (it->second.deviceId == deviceId)
+		{
+			KillTimer(g_hWnd, it->first);
+			it = g_pendingReconnects.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+	g_connectingDevices.erase(deviceId);
+	g_autoReconnectingDevices.erase(deviceId);
+	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+	UpdateNotifyIcon();
+}
+
+// One-shot timer that fires after PENDING_APPEAR_TIMEOUT_MS to give up waiting
+// for devices that were out-of-range at startup. Clears g_pendingConnectOnAppear
+// so those devices are no longer auto-connected when they eventually appear.
+VOID CALLBACK PendingAppearTimeoutTimerProc(HWND hwnd, UINT, UINT_PTR idEvent, DWORD)
+{
+	KillTimer(hwnd, idEvent);
+	if (!g_pendingConnectOnAppear.empty())
+	{
+		g_pendingConnectOnAppear.clear();
+		PostMessageW(hwnd, WM_REFRESHDEVICELIST, 0, 0);
+	}
 }
 
 void SetupDeviceWatcher()
@@ -1462,7 +1532,6 @@ void RefreshDeviceList()
 			// disconnect is not mistaken for a link drop and auto-reconnected.
 			g_audioPlaybackConnections.erase(it);
 			connection.Close();
-			ShowNotification(deviceName, _(L"Disconnected"), NIIF_INFO);
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 				UpdateNotifyIcon();
 			// Persist the reduced device list so a crashed/forced exit does not
@@ -1600,10 +1669,13 @@ void RefreshDeviceList()
 			g_mainAvailableListPanel.Children().Append(availCard);
 		}
 
-		// Devices currently connecting are shown with a "Connecting" status and disabled button.
+		// Devices currently connecting are shown with a "Connecting" status.
+		// Auto-reconnecting devices also get a "Cancel" button so the user can
+		// abort the retry chain and manually reconnect.
 		for (const auto& [id, name] : g_connectingDevices)
 		{
 			any = true;
+			const bool isAutoReconnect = g_autoReconnectingDevices.find(id) != g_autoReconnectingDevices.end();
 
 			TextBlock nameText;
 			nameText.Text(GetDeviceDisplayName(id, name));
@@ -1618,13 +1690,6 @@ void RefreshDeviceList()
 			statusText.VerticalAlignment(VerticalAlignment::Center);
 			statusText.Margin({ 8, 0, 0, 0 });
 
-			ProgressRing ring;
-			ring.IsActive(true);
-			ring.Width(20);
-			ring.Height(20);
-			ring.HorizontalAlignment(HorizontalAlignment::Right);
-			ring.VerticalAlignment(VerticalAlignment::Center);
-
 			Grid availGrid;
 			ColumnDefinition availCol0;
 			availCol0.Width(GridLength(1, GridUnitType::Star));
@@ -1637,10 +1702,39 @@ void RefreshDeviceList()
 			availGrid.ColumnDefinitions().Append(availCol2);
 			availGrid.Children().Append(nameText);
 			availGrid.Children().Append(statusText);
-			availGrid.Children().Append(ring);
 			Grid::SetColumn(nameText, 0);
 			Grid::SetColumn(statusText, 1);
-			Grid::SetColumn(ring, 2);
+
+			if (isAutoReconnect)
+			{
+				Button cancelButton;
+				cancelButton.Content(winrt::box_value(_(L"Cancel")));
+				cancelButton.FontSize(11);
+				cancelButton.Width(72);
+				cancelButton.Height(28);
+				cancelButton.HorizontalAlignment(HorizontalAlignment::Right);
+				cancelButton.VerticalAlignment(VerticalAlignment::Center);
+
+				std::wstring deviceId(id);
+				cancelButton.Click([deviceId](const auto&, const auto&) {
+					CancelReconnect(deviceId);
+				});
+
+				availGrid.Children().Append(cancelButton);
+				Grid::SetColumn(cancelButton, 2);
+			}
+			else
+			{
+				ProgressRing ring;
+				ring.IsActive(true);
+				ring.Width(20);
+				ring.Height(20);
+				ring.HorizontalAlignment(HorizontalAlignment::Right);
+				ring.VerticalAlignment(VerticalAlignment::Center);
+
+				availGrid.Children().Append(ring);
+				Grid::SetColumn(ring, 2);
+			}
 
 			Border availCard;
 			availCard.Child(availGrid);

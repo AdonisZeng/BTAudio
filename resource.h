@@ -8,12 +8,12 @@
 // Version information — single source of truth for both .rc and C++ code.
 #define BTAUDIO_VERSION_MAJOR      1
 #define BTAUDIO_VERSION_MINOR      1
-#define BTAUDIO_VERSION_PATCH      5
+#define BTAUDIO_VERSION_PATCH      6
 #define BTAUDIO_VERSION_BUILD      0
 
 // String representations — keep in sync with the four macros above.
-#define BTAUDIO_VERSION_STR        L"1.1.5.0"
-#define BTAUDIO_VERSION_WSTR       L"v1.1.5"
+#define BTAUDIO_VERSION_STR        L"1.1.6.0"
+#define BTAUDIO_VERSION_WSTR       L"v1.1.6"
 #define BTAUDIO_COPYRIGHT_STR      L"Copyright (C) 2026 AdonisZeng, 2020 Richard Yu"
 
 // Next default values for new objects

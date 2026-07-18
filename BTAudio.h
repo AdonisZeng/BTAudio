@@ -46,6 +46,17 @@ constexpr UINT STARTUP_DELAY_MS = 1500;
 constexpr int MANUAL_RETRY_COUNT = 2;
 constexpr int AUTO_RECONNECT_RETRY_COUNT = 8;
 
+// Wall-clock timeout for an auto-reconnect cycle (unexpected link drop). Caps
+// the entire retry chain so a permanently-unreachable device doesn't keep the
+// tray icon in the amber "connecting" state indefinitely.
+constexpr UINT AUTO_RECONNECT_TIMEOUT_MS = 120000; // 2 minutes
+
+// Wall-clock timeout for devices that were out-of-range at startup. After this
+// elapses, g_pendingConnectOnAppear is cleared and those devices are no longer
+// auto-connected when they eventually appear.
+constexpr UINT PENDING_APPEAR_TIMEOUT_MS = 300000; // 5 minutes
+constexpr UINT_PTR IDT_PENDING_APPEAR_TIMEOUT = 1002;
+
 HINSTANCE g_hInst;
 HWND g_hWnd;
 HWND g_hWndXaml;
@@ -72,6 +83,7 @@ struct PendingReconnect
 	int attempt;                 // index of the scheduled attempt (0-based) — drives backoff
 	bool isAutoReconnect;        // true => link-drop auto-reconnect (slower backoff, more tries)
 	bool notifyNextOnComplete;   // true => PostMessage(WM_CONNECTNEXT) when this attempt chain ends
+	ULONGLONG autoReconnectDeadline; // 0 = not an auto-reconnect (no deadline check)
 };
 std::map<UINT_PTR, PendingReconnect> g_pendingReconnects;
 // Device ids from g_lastDevices that were out-of-range when the startup
@@ -79,6 +91,10 @@ std::map<UINT_PTR, PendingReconnect> g_pendingReconnects;
 // promoted into g_connectQueue. This implements P2(六): don't waste the manual
 // retry budget on devices that aren't currently reachable.
 std::set<std::wstring> g_pendingConnectOnAppear;
+// Device ids currently in an auto-reconnect cycle (unexpected link drop).
+// Tracked separately so the UI can offer a "Cancel" button and the
+// ConnectDevice coroutine can detect user-initiated cancellation.
+std::set<std::wstring> g_autoReconnectingDevices;
 // FIFO of device ids awaiting a serial startup connect. Pumped by
 // WM_CONNECTNEXT; ConnectDevice(notifyNextOnComplete=true) posts WM_CONNECTNEXT
 // once its attempt chain finishes (success or final failure), so connects are
@@ -137,13 +153,16 @@ std::wstring g_renamingDeviceId;
 
 // Forward declarations — must appear before the .hpp includes so that
 // settings / utility helpers can call these functions.
-void ShowNotification(const std::wstring& title, const std::wstring& message, DWORD dwInfoFlags = NIIF_INFO);
 bool IsAutoStartEnabled();
 void SetAutoStart(bool enable);
 void SetupRenameFlyout();
 std::wstring GetDeviceDisplayName(const std::wstring& deviceId, std::wstring_view defaultName);
 int GetDeviceBatteryLevel(const std::wstring& deviceId);
 VOID CALLBACK StartupDelayTimerProc(HWND, UINT, UINT_PTR, DWORD);
+VOID CALLBACK PendingAppearTimeoutTimerProc(HWND, UINT, UINT_PTR, DWORD);
+// Cancel an in-progress auto-reconnect for a device: kills pending retry
+// timers, clears the connecting/auto-reconnect tracking, and refreshes the UI.
+void CancelReconnect(const std::wstring& deviceId);
 // Compute the backoff delay (ms) before the next reconnect attempt.
 // attempt is the 0-based index of the upcoming attempt. Auto-reconnect uses a
 // gentler exponential curve with a higher cap than a manual connect retry.

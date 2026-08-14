@@ -342,3 +342,7 @@ healthchecksdb
 translate/generated
 
 doc/
+
+# Reasonix session workspace
+.reasonix/
+

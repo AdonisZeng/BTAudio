@@ -1,7 +1,7 @@
 #pragma once
 #include "FnvHash.hpp"
 
-std::unordered_map<uint32_t, const wchar_t*> hashToStrMap;
+inline std::unordered_map<uint32_t, const wchar_t*> hashToStrMap;
 
 #pragma pack(push, 1)
 struct YMOData
@@ -15,9 +15,30 @@ struct YMOData
 };
 #pragma pack(pop)
 
-void LoadTranslateData()
+inline void LoadTranslateData()
 {
-	auto hRes = FindResourceExW(g_hInst, L"YMO", MAKEINTRESOURCEW(1), GetThreadUILanguage());
+	// Language preference overrides the thread UI language (0 = follow
+	// system, 3 = English which has no resource and falls back to source
+	// strings). English is also the fallback when a language resource is
+	// missing.
+	WORD langId = 0;
+	switch (g_language)
+	{
+	case 1:
+		langId = MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED);
+		break;
+	case 2:
+		langId = MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_TRADITIONAL);
+		break;
+	case 3:
+		langId = 0; // English — use source strings
+		break;
+	default:
+		langId = GetThreadUILanguage();
+		break;
+	}
+
+	auto hRes = langId ? FindResourceExW(g_hInst, L"YMO", MAKEINTRESOURCEW(1), langId) : nullptr;
 	if (hRes)
 	{
 		auto hResData = LoadResource(g_hInst, hRes);
@@ -40,7 +61,7 @@ void LoadTranslateData()
 	}
 }
 
-const wchar_t* Translate(const wchar_t* str)
+inline const wchar_t* Translate(const wchar_t* str)
 {
 	static std::unordered_map<const wchar_t*, const wchar_t*> ptrToStrMap;
 
@@ -62,7 +83,7 @@ const wchar_t* Translate(const wchar_t* str)
 	return translation;
 }
 
-const wchar_t* TranslateContext(const wchar_t* str, const wchar_t* ctxtStr)
+inline const wchar_t* TranslateContext(const wchar_t* str, const wchar_t* ctxtStr)
 {
 	auto translation = Translate(ctxtStr);
 	if (translation == ctxtStr)

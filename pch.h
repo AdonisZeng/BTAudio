@@ -18,6 +18,9 @@
 #include <shobjidl_core.h>
 #include <d2d1_3.h>
 #include <shlwapi.h>
+#include <shellscalingapi.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
 
 // C++ RunTime Header Files
 #include <cstdlib>
@@ -27,6 +30,7 @@
 #include <set>
 #include <deque>
 #include <filesystem>
+#include <mutex>
 
 // wil
 #ifndef _DEBUG
@@ -52,6 +56,7 @@
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
+#include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <windows.ui.xaml.hosting.desktopwindowxamlsource.h>
 #include <winrt/Windows.UI.Xaml.Markup.h>

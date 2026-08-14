@@ -77,3 +77,51 @@ msgstr "設定"
 #: BTAudio.cpp
 msgid "Done"
 msgstr "完成"
+
+#: BTAudio.cpp
+msgid "Unknown failure"
+msgstr "未知失敗"
+
+#: BTAudio.cpp
+msgid "Failed to connect to device"
+msgstr "連接裝置失敗"
+
+#: BTAudio.cpp
+msgid "Failed to check for updates or download the update. Please check your network connection and try again later."
+msgstr "檢查或下載更新失敗，請檢查網路連線後重試。"
+
+#: BTAudio.cpp
+msgid "Disconnected, reconnecting..."
+msgstr "已斷線，正在重新連線..."
+
+#: BTAudio.cpp
+msgid "Reconnect failed"
+msgstr "重新連線失敗"
+
+#: BTAudio.cpp
+msgid "Battery is low"
+msgstr "電量不足"
+
+#: BTAudio.cpp
+msgid "Follow system"
+msgstr "跟隨系統"
+
+#: BTAudio.cpp
+msgid "Debug logging"
+msgstr "偵錯記錄"
+
+#: BTAudio.cpp
+msgid "Language change will take effect after restart"
+msgstr "語言變更將在重新啟動後生效"
+
+#: BTAudio.cpp
+msgid "Update downloaded"
+msgstr "更新已下載"
+
+#: BTAudio.cpp
+msgid "The update is downloaded and will be installed when BTAudio exits. Restart now?"
+msgstr "更新已下載，將在 BTAudio 結束時自動安裝。立即重新啟動？"
+
+#: BTAudio.cpp
+msgid "Restart now"
+msgstr "立即重新啟動"

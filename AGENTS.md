@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents (Claude Code, Reasonix, etc.) when working with code in this repository.
 
 ## Project Overview
 
@@ -20,6 +20,7 @@ BTAudio is a Windows system-tray application that provides Bluetooth A2DP Sink a
 - **Precompiled header**: `pch.h` / `pch.cpp`
 - **Output**: `BTAudio64.exe` (x64), with platform suffix for other architectures
 - **Version**: Defined in `resource.h` (`BTAUDIO_VERSION_MAJOR`/`MINOR`/`PATCH`/`BUILD`)
+- **Translations**: `translate/generated/` (gitignored) is regenerated automatically by a `PreBuildEvent` running `translate/gen_rc.ps1` (requires python3; incremental — no-ops when the ymo files are fresh). Regenerate manually with `powershell -File translate/gen_rc.ps1` after editing `translate/source/*.po`.
 
 ## Code Architecture
 
@@ -46,10 +47,10 @@ BTAudio is a Windows system-tray application that provides Bluetooth A2DP Sink a
 
 | File | Purpose |
 |------|---------|
-| `resource.h` | Version macros (current 1.1.5), icon resource ID |
-| `BTAudio.rc` | Windows resources: icon, version info, SVG, i18n YMO |
+| `resource.h` | Version macros (current 1.1.7), icon resource ID |
+| `BTAudio.rc` | Windows resources: icon, version info, SVG |
 | `BTAudio.svg` | Tray icon SVG source (recolored at runtime for state/theme) |
-| `translate/generated/` | Compiled translation data files |
+| `translate/generated/` | Compiled translation data files (`translate.rc` + `zh_CN.ymo` / `zh_TW.ymo`, gitignored, auto-generated at build) |
 
 ### Architecture Overview (Message Flow)
 
@@ -62,10 +63,15 @@ BTAudio is a Windows system-tray application that provides Bluetooth A2DP Sink a
          ├── WM_CONNECTDEVICE → queue remembered devices for serial connect
          ├── WM_CONNECTNEXT   → dequeue & connect one device at a time
          ├── WM_DEVICEAPPEARED → promote out-of-range devices into queue
+         ├── WM_DEVICEADDED / WM_DEVICEUPDATED / WM_DEVICEREMOVED
+         │                    → DeviceWatcher callbacks (any thread) post
+         │                      payloads; UI thread updates g_availableDevices
          ├── WM_DEVICECLOSED  → auto-reconnect on unexpected link drop
+         ├── WM_CONNECTFAILED → TaskDialog for failed manual connects
          ├── WM_NOTIFYICON    → tray click (show menu / toggle window)
          ├── WM_REFRESHDEVICELIST → rebuild connected/available device lists
-         ├── WM_UPDATE*       → update notification dialogs
+         ├── WM_UPDATEAVAILABLE (carries ReleaseInfo) → update dialog
+         ├── WM_UPTODATE / WM_UPDATEFAILED → update notification dialogs
          └── WM_SETTINGCHANGE → theme change → update icons + XAML theme
 ```
 
@@ -79,7 +85,7 @@ ConnectDevice(deviceId/DeviceInformation)
   → On Permanent Failure: notify error, erase connection
 ```
 
-StateChanged(Closed) fires on an arbitrary thread. It posts `WM_DEVICECLOSED` to the UI thread, which calls `HandleDeviceClosed`. The decision to auto-reconnect is based on map membership: if the entry is still in `g_audioPlaybackConnections`, it's an unexpected link drop; if already removed, it was user-initiated.
+StateChanged(Closed) fires on an arbitrary thread. It posts `WM_DEVICECLOSED` to the UI thread, which calls `HandleDeviceClosed`. The decision to auto-reconnect is based on map membership PLUS a generation check: the message carries the ABI pointer of the connection that raised the event; if the connection currently in `g_audioPlaybackConnections` is a different instance (replaced by a reconnect / duplicate-connection teardown), the event is a stale `Close()` and is ignored. Entry still present with the same instance → unexpected link drop → auto-reconnect; entry already gone → user/system initiated → ignore.
 
 ### Retry/Reconnect Strategy
 
@@ -95,8 +101,17 @@ StateChanged(Closed) fires on an arbitrary thread. It posts `WM_DEVICECLOSED` to
 - **Settings**: saved as `BTAudio.json` next to the executable, incremental save on each connect/disconnect
 - **I18n**: custom FNV-1a hash-based system — strings are hashed at runtime and looked up in an embedded resource block per thread UI language, with `_("string")` / `C_(context, string)` macros
 - **Update mechanism**: downloads new EXE from GitHub, spawns a batch script that waits for the current process to exit, replaces the file, and relaunches
-- **Thread safety**: all global state mutations happen on the UI thread (message loop); the only cross-thread path is `StateChanged` → posts `WM_DEVICECLOSED` with a heap-allocated device id pointer
-- **Map ordering**: `g_audioPlaybackConnections` is a `std::map<std::wstring, ...>` (sorted), so the tray tooltip and UI iterate in deterministic order; `g_availableDevices` shares the same key type for O(log n) lookups
+- **Thread safety**: all global state mutations happen on the UI thread (message loop). Cross-thread paths are limited to code that ONLY forwards heap-allocated payloads via `PostMessage`: `StateChanged` → `WM_DEVICECLOSED` (device id + connection ABI pointer), DeviceWatcher callbacks → `WM_DEVICEADDED/UPDATED/REMOVED` (AddRef'd `IUnknown*`), update check → `WM_UPDATEAVAILABLE` (ReleaseInfo), and the `ConnectDevice` coroutine continuations → `WM_CONNECTRESULT` (ConnectResultInfo). The UI thread takes ownership and does all map bookkeeping.
+- **Map ordering**: `g_audioPlaybackConnections` is a `std::unordered_map` (NOT sorted) — do not rely on iteration order; the tray tooltip simply shows the first entry. `g_availableDevices` is a `std::map` (sorted by device id).
+
+### Known Issue — Coroutine Threading Model (FIXED)
+
+**Fixed** in the "coroutine thread model refactor": `ConnectDevice` coroutines no longer touch any global state. The app runs in an MTA (`winrt::init_apartment()`), so a `fire_and_forget` coroutine resumes on a thread-pool thread after `co_await`. Both `ConnectDevice` overloads now only perform the async operations (`CreateFromIdAsync` / `TryCreateFromId` / `StartAsync` / `OpenAsync`), collect the outcome into a heap-allocated `ConnectResultInfo`, and post it as `WM_CONNECTRESULT`. All map bookkeeping (`g_audioPlaybackConnections`, `g_connectingDevices`, `g_autoReconnectingDevices`, `g_pendingReconnects`, `g_connectInProgress`), `SaveSettings()`, `UpdateNotifyIcon()`, retry scheduling and dialogs/notifications happen in `HandleConnectResult` (or `StartConnect` for the "connecting" entry state) on the UI thread.
+
+Rules that keep it that way:
+- Start a connect chain ONLY via `StartConnect` (UI thread) — it sets the connecting state and launches the coroutine. Never call `ConnectDevice` directly from a coroutine continuation.
+- Never add global-state access to coroutine continuations. If a new async path needs to mutate state, post a message carrying a heap-allocated payload (as `WM_CONNECTRESULT`/`WM_DEVICECLOSED`/`WM_DEVICEADDED` do) and do the mutation on the UI thread.
+- `HandleConnectResult` performs the duplicate-connection replacement (erase + `Close()` before replacing) that the coroutine used to do, and the failure-path cleanup; the `StateChanged` callback still only forwards `WM_DEVICECLOSED`.
 
 ### Global State (in BTAudio.h)
 

@@ -1058,6 +1058,9 @@ void HandleConnectResult(ConnectResultInfo& info)
 {
 	if (info.success)
 	{
+		// Connecting phase is over regardless of outcome — drop the
+		// "connecting" status (mirrors the failure branch below).
+		g_connectingDevices.erase(info.deviceId);
 		// If the user cancelled the auto-reconnect while we were awaiting the
 		// async operation, honor the cancellation even though the link came up:
 		// close the fresh connection and persist the reduced device list. The

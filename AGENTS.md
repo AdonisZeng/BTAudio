@@ -47,7 +47,7 @@ BTAudio is a Windows system-tray application that provides Bluetooth A2DP Sink a
 
 | File | Purpose |
 |------|---------|
-| `resource.h` | Version macros (current 1.1.7), icon resource ID |
+| `resource.h` | Version macros (current 1.1.8), icon resource ID |
 | `BTAudio.rc` | Windows resources: icon, version info, SVG |
 | `BTAudio.svg` | Tray icon SVG source (recolored at runtime for state/theme) |
 | `translate/generated/` | Compiled translation data files (`translate.rc` + `zh_CN.ymo` / `zh_TW.ymo`, gitignored, auto-generated at build) |

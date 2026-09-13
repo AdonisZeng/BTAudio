@@ -47,7 +47,7 @@ BTAudio is a Windows system-tray application that provides Bluetooth A2DP Sink a
 
 | File | Purpose |
 |------|---------|
-| `resource.h` | Version macros (current 1.1.8), icon resource ID |
+| `resource.h` | Version macros (current 1.1.9), icon resource ID |
 | `BTAudio.rc` | Windows resources: icon, version info, SVG |
 | `BTAudio.svg` | Tray icon SVG source (recolored at runtime for state/theme) |
 | `translate/generated/` | Compiled translation data files (`translate.rc` + `zh_CN.ymo` / `zh_TW.ymo`, gitignored, auto-generated at build) |
@@ -81,8 +81,11 @@ BTAudio is a Windows system-tray application that provides Bluetooth A2DP Sink a
 ConnectDevice(deviceId/DeviceInformation)
   → TryCreateFromId → register StateChanged → StartAsync → OpenAsync
   → On Success: add to g_audioPlaybackConnections, persist, notify
-  → On Transient Failure: retry with exponential backoff
-  → On Permanent Failure: notify error, erase connection
+  → On Failure: Close the failed connection object (deterministic transport
+    teardown), retry transient failures with exponential backoff
+  → A failed chain NEVER touches g_audioPlaybackConnections — an entry there
+    belongs to a healthy connection from another chain; link drops arrive via
+    WM_DEVICECLOSED, duplicates are replaced on the success path
 ```
 
 StateChanged(Closed) fires on an arbitrary thread. It posts `WM_DEVICECLOSED` to the UI thread, which calls `HandleDeviceClosed`. The decision to auto-reconnect is based on map membership PLUS a generation check: the message carries the ABI pointer of the connection that raised the event; if the connection currently in `g_audioPlaybackConnections` is a different instance (replaced by a reconnect / duplicate-connection teardown), the event is a stale `Close()` and is ignored. Entry still present with the same instance → unexpected link drop → auto-reconnect; entry already gone → user/system initiated → ignore.
@@ -109,9 +112,10 @@ StateChanged(Closed) fires on an arbitrary thread. It posts `WM_DEVICECLOSED` to
 **Fixed** in the "coroutine thread model refactor": `ConnectDevice` coroutines no longer touch any global state. The app runs in an MTA (`winrt::init_apartment()`), so a `fire_and_forget` coroutine resumes on a thread-pool thread after `co_await`. Both `ConnectDevice` overloads now only perform the async operations (`CreateFromIdAsync` / `TryCreateFromId` / `StartAsync` / `OpenAsync`), collect the outcome into a heap-allocated `ConnectResultInfo`, and post it as `WM_CONNECTRESULT`. All map bookkeeping (`g_audioPlaybackConnections`, `g_connectingDevices`, `g_autoReconnectingDevices`, `g_pendingReconnects`, `g_connectInProgress`), `SaveSettings()`, `UpdateNotifyIcon()`, retry scheduling and dialogs/notifications happen in `HandleConnectResult` (or `StartConnect` for the "connecting" entry state) on the UI thread.
 
 Rules that keep it that way:
-- Start a connect chain ONLY via `StartConnect` (UI thread) — it sets the connecting state and launches the coroutine. Never call `ConnectDevice` directly from a coroutine continuation.
+- Start a connect chain ONLY via `StartConnect` (UI thread) — it sets the connecting state, guards against a second concurrent chain for the same device (returns false if one is already in flight; `ReconnectTimerProc` erases the "connecting" entry first to legitimately restart a chain), and launches the coroutine. Never call `ConnectDevice` directly from a coroutine continuation.
 - Never add global-state access to coroutine continuations. If a new async path needs to mutate state, post a message carrying a heap-allocated payload (as `WM_CONNECTRESULT`/`WM_DEVICECLOSED`/`WM_DEVICEADDED` do) and do the mutation on the UI thread.
-- `HandleConnectResult` performs the duplicate-connection replacement (erase + `Close()` before replacing) that the coroutine used to do, and the failure-path cleanup; the `StateChanged` callback still only forwards `WM_DEVICECLOSED`.
+- `HandleConnectResult` performs the duplicate-connection replacement (erase + `Close()` before replacing) that the coroutine used to do; the `StateChanged` callback still only forwards `WM_DEVICECLOSED`. A FAILED chain never touches `g_audioPlaybackConnections` (its entry, if any, belongs to a healthy connection from a concurrent chain) — the coroutine `Close()`es the failed connection object itself for deterministic transport teardown.
+- `WM_DEVICEREMOVED` cancels any pending reconnect for the removed device (the id can no longer resolve); an in-flight attempt is cleaned up via the cancellation check in `HandleConnectResult`.
 
 ### Global State (in BTAudio.h)
 

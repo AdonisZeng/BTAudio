@@ -475,7 +475,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			// notifyNextOnComplete => chain to the next queued device once this
 			// connect (including its retries) settles, and clear the in-flight
 			// flag so the pump can resume.
-			StartConnect(std::move(deviceId), MANUAL_RETRY_COUNT, 0, false, true);
+			if (!StartConnect(std::move(deviceId), MANUAL_RETRY_COUNT, 0, false, true))
+			{
+				// A chain is already in flight for this device (manual click
+				// raced the queue) — skip it and pump the next queued device.
+				g_connectInProgress = false;
+				PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
+			}
 		}
 		break;
 	case WM_DEVICEAPPEARED:
@@ -520,6 +526,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 		// Stop waiting for a device that has left range entirely.
 		g_pendingConnectOnAppear.erase(*pId);
+		// The device is gone from the system (unpaired / interface removed) —
+		// also drop any pending reconnect for it. Its UI card is already gone
+		// (erased above), so no new chain can be started for this id; an
+		// in-flight attempt is cleaned up through the cancellation check in
+		// HandleConnectResult when its result arrives.
+		CancelReconnect(*pId);
 	}
 	break;
 	case WM_REFRESHDEVICELIST:
@@ -836,10 +848,24 @@ VOID CALLBACK ReconnectTimerProc(HWND hwnd, UINT, UINT_PTR idEvent, DWORD)
 	{
 		PendingReconnect pr = std::move(it->second);
 		g_pendingReconnects.erase(it);
-		// deviceId is moved into the coroutine frame (passed by value), so it is
-		// safe across the suspension points inside ConnectDevice even though this
-		// stack frame returns immediately afterwards.
-		StartConnect(std::move(pr.deviceId), pr.retryCount, pr.attempt, pr.isAutoReconnect, pr.notifyNextOnComplete, pr.autoReconnectDeadline);
+		// Lift the re-entrancy guard in StartConnect: the "connecting" entry
+		// was only kept around to render the Connecting state during the
+		// backoff — StartConnect re-adds it immediately. deviceId is moved
+		// into the coroutine frame (passed by value), so it is safe across the
+		// suspension points inside ConnectDevice even though this stack frame
+		// returns immediately afterwards.
+		g_connectingDevices.erase(pr.deviceId);
+		if (!StartConnect(std::move(pr.deviceId), pr.retryCount, pr.attempt, pr.isAutoReconnect, pr.notifyNextOnComplete, pr.autoReconnectDeadline))
+		{
+			// A different chain is already connecting this device (manual
+			// click / auto-reconnect race) — this chain gives up. Keep the
+			// serial pump moving if this was a queued startup connect.
+			if (pr.notifyNextOnComplete)
+			{
+				g_connectInProgress = false;
+				PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
+			}
+		}
 	}
 }
 
@@ -884,9 +910,19 @@ UINT ComputeReconnectDelay(int attempt, bool isAutoReconnect)
 // coroutine. The coroutine must NOT be called directly from a coroutine
 // continuation: everything after co_await runs on a thread-pool thread, so the
 // "connecting" bookkeeping belongs here, on the UI thread.
+//
+// Re-entrancy: returns false without starting anything if a chain is already
+// in flight for this device (i.e. it is in g_connectingDevices). Two
+// concurrent chains for one device race over the radio and — worse — the
+// failing chain's result used to tear down the healthy connection the other
+// chain had just established. Callers that legitimately restart a chain
+// (ReconnectTimerProc) erase the "connecting" entry first.
 // ---------------------------------------------------------------------------
-void StartConnect(const std::wstring& deviceId, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
+bool StartConnect(const std::wstring& deviceId, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
 {
+	// Re-entrancy guard — see the comment above.
+	if (g_connectingDevices.find(deviceId) != g_connectingDevices.end())
+		return false;
 	// Best-effort real name from the watcher list for the connecting status.
 	// The coroutine reports the authoritative name back via WM_CONNECTRESULT,
 	// which re-fills g_connectingDevices on retries.
@@ -897,13 +933,19 @@ void StartConnect(const std::wstring& deviceId, int retryCount, int attempt, boo
 	g_connectingDevices.emplace(deviceId, deviceName);
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 	ConnectDevice(deviceId, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline);
+	return true;
 }
 
-void StartConnect(const DeviceInformation& device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
+bool StartConnect(const DeviceInformation& device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
 {
-	g_connectingDevices.emplace(std::wstring(device.Id()), std::wstring(device.Name()));
+	// Re-entrancy guard — see the comment above.
+	const std::wstring id(device.Id());
+	if (g_connectingDevices.find(id) != g_connectingDevices.end())
+		return false;
+	g_connectingDevices.emplace(id, std::wstring(device.Name()));
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 	ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline);
+	return true;
 }
 
 winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
@@ -925,9 +967,12 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 	info.notifyNextOnComplete = notifyNextOnComplete;
 	info.autoReconnectDeadline = autoReconnectDeadline;
 
+	// Declared outside the try so the failure teardown below can Close it even
+	// when StartAsync / OpenAsync threw.
+	AudioPlaybackConnection connection{ nullptr };
 	try
 	{
-		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
+		connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
 			// The StateChanged event may be raised on an arbitrary thread. Do NOT
@@ -1012,6 +1057,17 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 		LOG_CAUGHT_EXCEPTION();
 	}
 
+	// Deterministic teardown on failure. Per the AudioPlaybackConnection docs,
+	// the underlying (per-device) transport is only deactivated once ALL
+	// references are released — merely dropping the last reference defers that
+	// teardown. Closing the object here tears the A2DP sink session down
+	// immediately, so a scheduled retry (or the user's next click) starts from
+	// a clean slate instead of racing the previous attempt's cleanup. On
+	// success, info.connection owns a separate reference and the session must
+	// stay up, so there is nothing to close.
+	if (!info.success && connection)
+		connection.Close();
+
 	// Hand the outcome to the UI thread. All global-state effects (connection
 	// map updates, retry scheduling, notifications, settings persistence) are
 	// applied by HandleConnectResult on the UI thread.
@@ -1031,16 +1087,31 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int 
 		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
 		ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline);
 	}
-	catch (winrt::hresult_error const&)
+	catch (winrt::hresult_error const& ex)
 	{
-		// The device may have left range between scheduling the retry and firing
-		// it. Silently drop the attempt (no errorMessage => HandleConnectResult
-		// stays quiet) and let the UI thread do the cleanup and queue chaining.
+		// CreateFromIdAsync failed — the id is no longer resolvable (unpaired /
+		// interface removed) or the enumeration service failed transiently.
+		// Preserve the FULL chain state (retryCount / attempt / deadline) so
+		// the retry machinery on the UI thread keeps its budget, and report an
+		// error message: with an empty errorMessage, a MANUAL connect used to
+		// die completely silently (no dialog, no retry — just a spinner that
+		// vanished), which looked like "clicking Connect does nothing".
 		LOG_CAUGHT_EXCEPTION();
 		ConnectResultInfo info{};
 		info.deviceId = std::move(deviceId);
+		info.retryCount = retryCount;
+		info.attempt = attempt;
 		info.isAutoReconnect = isAutoReconnect;
 		info.notifyNextOnComplete = notifyNextOnComplete;
+		info.autoReconnectDeadline = autoReconnectDeadline;
+		info.shouldRetry = true; // the enumeration failure may be transient
+		info.errorMessage.resize(64);
+		auto n = swprintf(info.errorMessage.data(), info.errorMessage.size(),
+			L"%ls (0x%08X)", ex.message().c_str(), static_cast<uint32_t>(ex.code()));
+		if (n > 0)
+			info.errorMessage.resize(n);
+		else
+			info.errorMessage = std::wstring(ex.message());
 		auto* pInfo = new ConnectResultInfo(std::move(info));
 		if (!PostMessageW(g_hWnd, WM_CONNECTRESULT, reinterpret_cast<WPARAM>(pInfo), 0))
 		{
@@ -1120,16 +1191,13 @@ void HandleConnectResult(ConnectResultInfo& info)
 	// ---- Failure ----
 	// Connecting phase is over regardless of outcome.
 	g_connectingDevices.erase(info.deviceId);
-	// Defensive cleanup: if an entry somehow still exists (e.g. a concurrent
-	// connect replaced this one), remove it BEFORE Close() so the resulting
-	// StateChanged(Closed) is not mistaken for a link drop.
-	auto it = g_audioPlaybackConnections.find(info.deviceId);
-	if (it != g_audioPlaybackConnections.end())
-	{
-		auto conn = it->second.second;
-		g_audioPlaybackConnections.erase(it);
-		conn.Close();
-	}
+	// NOTE: this chain did NOT establish a connection, so it must not touch
+	// g_audioPlaybackConnections. If an entry exists here it belongs to a
+	// healthy connection opened by a concurrent chain — the old "defensive
+	// cleanup" closed it, producing ghost disconnects right after a successful
+	// connect. Real link drops of an established connection are reported via
+	// WM_DEVICECLOSED, and duplicate connections are replaced on the success
+	// path above.
 
 	// Retry transient failures (timeout / unknown) with exponential backoff so
 	// the user does not have to manually toggle Bluetooth. The retry runs back
@@ -1168,7 +1236,12 @@ void HandleConnectResult(ConnectResultInfo& info)
 		const int nextAttempt = info.attempt + 1;
 		const UINT delay = ComputeReconnectDelay(nextAttempt, info.isAutoReconnect);
 		// Keep showing the "Connecting" state while we wait out the backoff.
-		g_connectingDevices.emplace(info.deviceId, info.deviceName);
+		// Never clobber an existing name with an empty one — a chain whose
+		// CreateFromIdAsync failed has no name to report.
+		if (!info.deviceName.empty())
+			g_connectingDevices.insert_or_assign(info.deviceId, info.deviceName);
+		else
+			g_connectingDevices.emplace(info.deviceId, info.deviceName);
 		if (UINT_PTR timerId = SetTimer(g_hWnd, 0, delay, ReconnectTimerProc))
 		{
 			g_pendingReconnects[timerId] = { info.deviceId, info.retryCount - 1, nextAttempt, info.isAutoReconnect, info.notifyNextOnComplete, info.autoReconnectDeadline };

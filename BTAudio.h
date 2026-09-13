@@ -277,9 +277,12 @@ void HandleConnectResult(ConnectResultInfo& info);
 // UI-thread entry point that starts a connect attempt chain: marks the device
 // as "connecting" (g_connectingDevices) and launches the ConnectDevice
 // coroutine, which then only talks back via WM_CONNECTRESULT. Never call the
-// coroutine directly from a coroutine continuation.
-void StartConnect(const std::wstring& deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
-void StartConnect(const DeviceInformation& device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
+// coroutine directly from a coroutine continuation. Returns false (starting
+// nothing) if a chain is already in flight for this device — callers that
+// legitimately restart a chain (ReconnectTimerProc) erase the "connecting"
+// entry first.
+bool StartConnect(const std::wstring& deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
+bool StartConnect(const DeviceInformation& device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
 
 #include "Util.hpp"
 #include "I18n.hpp"

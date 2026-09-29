@@ -9,6 +9,7 @@ RECT GetTrayIconRect();
 winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
 winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
 void SetupDeviceWatcher();
+void RestartDeviceWatcher();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
 void ApplyTheme();
@@ -23,6 +24,7 @@ void SetupRenameFlyout();
 std::wstring GetDeviceDisplayName(const std::wstring& deviceId, std::wstring_view defaultName);
 int GetDeviceBatteryLevel(const std::wstring& deviceId);
 VOID CALLBACK StartupDelayTimerProc(HWND, UINT, UINT_PTR, DWORD);
+VOID CALLBACK WatcherPollTimerProc(HWND, UINT, UINT_PTR, DWORD);
 
 // ---------------------------------------------------------------------------
 // Debug logging — wil diagnostics are appended to BTAudio.log next to the exe
@@ -308,6 +310,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	SetupSettingsFlyout();
 	SetupRenameFlyout();
 	SetupDeviceWatcher();
+	// Periodic DeviceWatcher liveness check — see WatcherPollTimerProc.
+	SetTimer(g_hWnd, IDT_WATCHER_POLL, WATCHER_POLL_INTERVAL_MS, WatcherPollTimerProc);
 	SetupSvgIcon();
 	SetupMainWindow();
 
@@ -475,7 +479,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			// notifyNextOnComplete => chain to the next queued device once this
 			// connect (including its retries) settles, and clear the in-flight
 			// flag so the pump can resume.
-			if (!StartConnect(std::move(deviceId), MANUAL_RETRY_COUNT, 0, false, true))
+			if (!StartConnect(std::move(deviceId), STARTUP_RETRY_COUNT, 0, false, true))
 			{
 				// A chain is already in flight for this device (manual click
 				// raced the queue) — skip it and pump the next queued device.
@@ -891,7 +895,8 @@ UINT ComputeReconnectDelay(int attempt, bool isAutoReconnect)
 	}
 	else
 	{
-		// Manual connect retry: 500ms, 1s, 2s, 4s ...
+		// Manual connect retry: the first retry (attempt 1) waits 1s, then
+		// 2s, 4s ... capped at 4s. (attempt indexes the UPCOMING attempt.)
 		constexpr UINT baseDelay = 500;
 		constexpr UINT maxDelay = 4000;
 		UINT delay = baseDelay;
@@ -901,6 +906,38 @@ UINT ComputeReconnectDelay(int attempt, bool isAutoReconnect)
 		}
 		return (std::min)(delay, maxDelay);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect retry timers use an application-managed id range instead of
+// letting SetTimer pick one (nIDEvent=0): a system-chosen id could collide
+// with the fixed IDT_* timers (1001-1003), and a later SetTimer with a fixed
+// id would silently replace the pending reconnect timer — the retry would
+// never fire and, for a queued startup chain, g_connectInProgress would stay
+// true forever, deadlocking the serial pump.
+// ---------------------------------------------------------------------------
+constexpr UINT_PTR RECONNECT_TIMER_ID_FIRST = 0x1000;
+constexpr UINT_PTR RECONNECT_TIMER_ID_LAST = 0x1FFF;
+UINT_PTR g_nextReconnectTimerId = RECONNECT_TIMER_ID_FIRST;
+
+// Returns a free id from the dedicated range, or 0 when the range is
+// exhausted (4096 concurrent pending reconnects — practically impossible;
+// the caller then takes the same final-failure path as a failed SetTimer).
+// UI thread only (called from HandleConnectResult alongside the map update).
+UINT_PTR AllocateReconnectTimerId()
+{
+	for (UINT_PTR i = RECONNECT_TIMER_ID_FIRST; i <= RECONNECT_TIMER_ID_LAST; ++i)
+	{
+		UINT_PTR id = g_nextReconnectTimerId;
+		g_nextReconnectTimerId = (id >= RECONNECT_TIMER_ID_LAST)
+			? RECONNECT_TIMER_ID_FIRST
+			: id + 1;
+		// Skip ids already handed out to a live pending reconnect. The fixed
+		// IDT_* ids (1001-1003) are below this range by construction.
+		if (g_pendingReconnects.find(id) == g_pendingReconnects.end())
+			return id;
+	}
+	return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -986,8 +1023,14 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 			connection.StateChanged([](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
 				{
+					// Hold a strong reference to the closing connection: it
+					// cannot be freed (and its address reused by a fresh
+					// connection) before the UI thread processes this
+					// message, which makes the raw-pointer identity check in
+					// HandleDeviceClosed safe.
 					auto* pInfo = new DeviceClosedInfo{
 						std::wstring(sender.DeviceId()),
+						sender,
 						winrt::get_abi(sender)
 					};
 					if (!PostMessageW(g_hWnd, WM_DEVICECLOSED,
@@ -1040,6 +1083,10 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 	}
 	catch (winrt::hresult_error const& ex)
 	{
+		// StartAsync/OpenAsync exceptions are usually transient (radio not
+		// ready at logon, stack busy after sleep/resume) — route them through
+		// the unified retry path instead of failing the chain outright.
+		info.shouldRetry = true;
 		info.errorMessage.resize(64);
 		while (1)
 		{
@@ -1242,7 +1289,8 @@ void HandleConnectResult(ConnectResultInfo& info)
 			g_connectingDevices.insert_or_assign(info.deviceId, info.deviceName);
 		else
 			g_connectingDevices.emplace(info.deviceId, info.deviceName);
-		if (UINT_PTR timerId = SetTimer(g_hWnd, 0, delay, ReconnectTimerProc))
+		if (UINT_PTR timerId = AllocateReconnectTimerId();
+			timerId && SetTimer(g_hWnd, timerId, delay, ReconnectTimerProc))
 		{
 			g_pendingReconnects[timerId] = { info.deviceId, info.retryCount - 1, nextAttempt, info.isAutoReconnect, info.notifyNextOnComplete, info.autoReconnectDeadline };
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
@@ -1269,9 +1317,20 @@ void HandleConnectResult(ConnectResultInfo& info)
 			ShowTrayNotification(L"BTAudio", text.c_str());
 		}
 	}
+	// Startup reconnect chains (serial pump) intentionally never show a
+	// modal dialog, but a final failure must not be fully silent either —
+	// otherwise a device whose radio was slow to come up just looks like
+	// "the phone cannot connect to this PC". Surface a non-modal tray
+	// notification, reusing the already-translated "Reconnect failed" string.
+	if (!info.isAutoReconnect && info.notifyNextOnComplete && !info.errorMessage.empty())
+	{
+		std::wstring text = GetDeviceDisplayName(info.deviceId, info.deviceName) +
+			L" — " + _(L"Reconnect failed");
+		ShowTrayNotification(L"BTAudio", text.c_str());
+	}
 	// Surface the failure for a manual connect (user clicked Connect /
-	// Reconnect). Auto-reconnects and the startup queue stay silent so the
-	// user is not spammed by modal dialogs.
+	// Reconnect). Auto-reconnects and startup chains only get a non-modal
+	// tray notification (above), so the user is not spammed by modal dialogs.
 	if (!info.isAutoReconnect && !info.notifyNextOnComplete && !info.errorMessage.empty())
 	{
 		std::wstring content = GetDeviceDisplayName(info.deviceId, info.deviceName) +
@@ -1322,21 +1381,21 @@ void HandleDeviceClosed(const std::wstring& deviceId, void* connectionAbiPtr)
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 	UpdateNotifyIcon();
 
-	if (!deviceName.empty())
-	{
-		// Kick off an automatic reconnect with a larger retry budget and gentler
-		// exponential backoff so a briefly-out-of-range / sleeping device gets a
-		// chance to come back without user intervention. The wall-clock deadline
-		// caps the entire chain so a permanently-unreachable device doesn't keep
-		// the tray icon amber indefinitely.
-		g_autoReconnectingDevices.insert(deviceId);
-		// Tell the user the link dropped and a reconnect is being attempted.
-		// Safe to call directly: this runs on the UI thread.
-		std::wstring text = deviceName + L" — " + _(L"Disconnected, reconnecting...");
-		ShowTrayNotification(L"BTAudio", text.c_str());
-		StartConnect(deviceId, AUTO_RECONNECT_RETRY_COUNT, 0, true, false,
-			GetTickCount64() + AUTO_RECONNECT_TIMEOUT_MS);
-	}
+	// Kick off an automatic reconnect with a larger retry budget and gentler
+	// exponential backoff so a briefly-out-of-range / sleeping device gets a
+	// chance to come back without user intervention. The wall-clock deadline
+	// caps the entire chain so a permanently-unreachable device doesn't keep
+	// the tray icon amber indefinitely. Nameless devices are reconnected too —
+	// the display name is only needed for the notification text below, where
+	// the raw device id is an acceptable fallback.
+	g_autoReconnectingDevices.insert(deviceId);
+	// Tell the user the link dropped and a reconnect is being attempted.
+	// Safe to call directly: this runs on the UI thread.
+	std::wstring text = (deviceName.empty() ? deviceId : deviceName) +
+		L" — " + _(L"Disconnected, reconnecting...");
+	ShowTrayNotification(L"BTAudio", text.c_str());
+	StartConnect(deviceId, AUTO_RECONNECT_RETRY_COUNT, 0, true, false,
+		GetTickCount64() + AUTO_RECONNECT_TIMEOUT_MS);
 }
 
 // Reconcile g_pendingConnectOnAppear against the devices the watcher has now
@@ -1414,6 +1473,30 @@ VOID CALLBACK PendingAppearTimeoutTimerProc(HWND hwnd, UINT, UINT_PTR idEvent, D
 	}
 }
 
+// ---------------------------------------------------------------------------
+// WatcherPollTimerProc — periodic DeviceWatcher liveness check. DeviceWatcher
+// has no StatusChanged event in the C++/WinRT projection of recent Windows
+// SDKs, so watcher aborts (Bluetooth service hiccup, sleep/resume, driver
+// reset) are detected by polling Status() — a cheap property read. Without
+// this, after an abort the device list would freeze forever: no
+// Added/Updated/Removed events arrive anymore and pending out-of-range
+// startup devices are never promoted. Runs on the UI thread (SetTimer
+// callback fires inside the message loop).
+// ---------------------------------------------------------------------------
+VOID CALLBACK WatcherPollTimerProc(HWND, UINT, UINT_PTR, DWORD)
+{
+	try
+	{
+		if (g_deviceWatcher &&
+			g_deviceWatcher.Status() == DeviceWatcherStatus::Aborted)
+			RestartDeviceWatcher();
+	}
+	catch (...)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+}
+
 void SetupDeviceWatcher()
 {
 	// Use the A2DP sink device selector so the watcher surfaces exactly the
@@ -1459,7 +1542,44 @@ void SetupDeviceWatcher()
 		}
 	});
 
+	// NOTE: watcher aborts are NOT detected here — DeviceWatcher::StatusChanged
+	// is not exposed by the C++/WinRT projection of recent Windows SDKs.
+	// Detection is done by WatcherPollTimerProc (polls Status() instead).
 	g_deviceWatcher.Start();
+}
+
+// ---------------------------------------------------------------------------
+// RestartDeviceWatcher — rebuild the DeviceWatcher after it aborted (e.g.
+// after a Bluetooth service crash or a sleep/resume cycle). Runs on the UI
+// thread (called from WatcherPollTimerProc): the aborted watcher is released —
+// which detaches its event handlers — the available-device cache is cleared,
+// and a fresh watcher re-enumerates everything through the normal
+// WM_DEVICEADDED path. Active connections and all connect-state maps are
+// untouched: in-flight connects and auto-reconnects are unaffected, and
+// g_pendingConnectOnAppear keeps working because the fresh watcher reports
+// the remembered devices again.
+// ---------------------------------------------------------------------------
+void RestartDeviceWatcher()
+{
+	if (g_deviceWatcher)
+	{
+		try
+		{
+			// Stop() may throw on an already-aborted watcher — ignore; only
+			// releasing the instance matters (it detaches the handlers).
+			g_deviceWatcher.Stop();
+		}
+		catch (...)
+		{
+			LOG_CAUGHT_EXCEPTION();
+		}
+		g_deviceWatcher = nullptr;
+	}
+	// The fresh watcher's initial enumeration re-reports every device, so the
+	// stale cache can simply be dropped (WM_DEVICEADDED refills it).
+	g_availableDevices.clear();
+	SetupDeviceWatcher();
+	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 }
 
 void SetupSvgIcon()

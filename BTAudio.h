@@ -68,18 +68,44 @@ constexpr UINT STARTUP_DELAY_MS = 1500;
 // longer window with exponential backoff so a briefly-out-of-range device has
 // time to come back.
 constexpr int MANUAL_RETRY_COUNT = 2;
-constexpr int AUTO_RECONNECT_RETRY_COUNT = 8;
+// Budget for the startup serial reconnect (WM_CONNECTNEXT). Deliberately
+// larger than a manual connect: at logon the Bluetooth radio is often not
+// ready when the pump starts, so the chain must ride out slow stack
+// initialization (manual backoff curve: 1s, 2s, then 4s capped — roughly
+// 19s of backoff across 7 attempts).
+constexpr int STARTUP_RETRY_COUNT = 6;
+// Auto-reconnect (unexpected link drop): enough attempts to actually reach
+// the AUTO_RECONNECT_TIMEOUT_MS wall-clock cap. 12 attempts with the
+// 1s..30s backoff curve span several minutes; without this the chain would
+// exhaust its attempts long before the deadline and the effective
+// availability window would stay short no matter how long the deadline is.
+constexpr int AUTO_RECONNECT_RETRY_COUNT = 12;
 
 // Wall-clock timeout for an auto-reconnect cycle (unexpected link drop). Caps
 // the entire retry chain so a permanently-unreachable device doesn't keep the
-// tray icon in the amber "connecting" state indefinitely.
-constexpr UINT AUTO_RECONNECT_TIMEOUT_MS = 120000; // 2 minutes
+// tray icon in the amber "connecting" state indefinitely. Kept generous:
+// once this chain ends, no AudioPlaybackConnection object is held anymore,
+// the A2DP sink transport is deactivated, and the phone can no longer
+// connect to the PC at all — so this window IS the window in which a device
+// that comes back late (sleep/resume, briefly out of range) can return
+// without the user re-connecting it from the app.
+constexpr UINT AUTO_RECONNECT_TIMEOUT_MS = 600000; // 10 minutes
 
 // Wall-clock timeout for devices that were out-of-range at startup. After this
 // elapses, g_pendingConnectOnAppear is cleared and those devices are no longer
 // auto-connected when they eventually appear.
 constexpr UINT PENDING_APPEAR_TIMEOUT_MS = 300000; // 5 minutes
 constexpr UINT_PTR IDT_PENDING_APPEAR_TIMEOUT = 1002;
+
+// Periodic DeviceWatcher liveness check. DeviceWatcher::StatusChanged is NOT
+// exposed by the C++/WinRT projection of recent Windows SDKs (verified against
+// Windows SDK 10.0.28000.0 / UniversalApiContract 20.0: IDeviceWatcher only
+// has Added/Updated/Removed/EnumerationCompleted/Stopped/Status/Start/Stop),
+// so watcher aborts are detected by polling Status() — a cheap property read
+// on the UI thread. Worst-case recovery latency after an abort is one poll
+// interval.
+constexpr UINT_PTR IDT_WATCHER_POLL = 1004;
+constexpr UINT WATCHER_POLL_INTERVAL_MS = 30000; // 30 seconds
 
 // Battery level (percent) at or below which the user gets a tray notification.
 constexpr int LOW_BATTERY_THRESHOLD = 20;
@@ -245,6 +271,11 @@ UINT ComputeReconnectDelay(int attempt, bool isAutoReconnect);
 struct DeviceClosedInfo
 {
     std::wstring deviceId;
+    // Strong reference to the connection that raised Closed: the object
+    // cannot be freed (and its address reused by a freshly created
+    // connection) before the UI thread processes this message, which is
+    // what makes the raw-pointer identity check in HandleDeviceClosed safe.
+    winrt::Windows::Media::Audio::AudioPlaybackConnection connection;
     void* connectionAbiPtr; // AudioPlaybackConnection ABI pointer (identity only)
 };
 void HandleDeviceClosed(const std::wstring& deviceId, void* connectionAbiPtr);

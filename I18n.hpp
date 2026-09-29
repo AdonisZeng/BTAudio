@@ -63,7 +63,14 @@ inline void LoadTranslateData()
 
 inline const wchar_t* Translate(const wchar_t* str)
 {
-	static std::unordered_map<const wchar_t*, const wchar_t*> ptrToStrMap;
+	// thread_local, NOT plain static: Translate runs both on the UI thread
+	// and inside ConnectDevice coroutine continuations on thread-pool
+	// threads (the app is an MTA, so co_await resumes on the pool). A shared
+	// map written lazily from several threads would race (concurrent
+	// find/emplace -> heap corruption, potentially crashing the whole app
+	// and dropping every Bluetooth connection). Per-thread caches need no
+	// lock; keys/values are string literals with static storage duration.
+	static thread_local std::unordered_map<const wchar_t*, const wchar_t*> ptrToStrMap;
 
 	auto translation = str;
 

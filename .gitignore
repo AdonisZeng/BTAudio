@@ -346,3 +346,5 @@ doc/
 # Reasonix session workspace
 .reasonix/
 
+.codegraph/
+

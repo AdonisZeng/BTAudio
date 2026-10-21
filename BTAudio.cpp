@@ -2,13 +2,15 @@
 #include "BTAudio.h"
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK HandleMessage(HWND, UINT, WPARAM, LPARAM);
+void PrepareFlyoutAnchor(const RECT& iconRect);
 void SetupFlyout();
 void SetupMenu();
 void SetupSettingsFlyout();
 RECT GetTrayIconRect();
-winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
-winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
-void SetupDeviceWatcher();
+winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0, uint64_t chainId = 0);
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0, uint64_t chainId = 0);
+bool SetupDeviceWatcher();
 void RestartDeviceWatcher();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
@@ -16,7 +18,7 @@ void ApplyTheme();
 void SetupMainWindow();
 void ShowMainWindow();
 void HideMainWindow();
-void RefreshDeviceList();
+void RefreshDeviceList(bool force = false);
 void ShowTrayNotification(const wchar_t* title, const wchar_t* text, DWORD flags = NIIF_INFO);
 void ShowUpdateDialog();
 void ShowUpdateInstalledDialog();
@@ -47,20 +49,35 @@ private:
 	bool& m_flag;
 };
 
-void DebugLogCallback(wil::FailureInfo*, PWSTR pszDebugMessage, size_t cchDebugMessage) noexcept
+// NOTE: wil declares the result-message callback as __stdcall (the calling
+// convention only differs on x86, but the Win32 build fails without it).
+void __stdcall DebugLogCallback(wil::FailureInfo*, PWSTR pszDebugMessage, size_t cchDebugMessage) noexcept
 {
-	if (!pszDebugMessage || cchDebugMessage == 0)
-		return;
-	std::lock_guard<std::mutex> lock(g_logMutex);
-	auto path = GetModuleFsPath(g_hInst).remove_filename() / L"BTAudio.log";
-	wil::unique_hfile hFile(CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
-		nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-	if (!hFile)
-		return;
-	DWORD written = 0;
-	WriteFile(hFile.get(), pszDebugMessage, static_cast<DWORD>(cchDebugMessage * sizeof(wchar_t)), &written, nullptr);
-	static const wchar_t newline[] = L"\r\n";
-	WriteFile(hFile.get(), newline, static_cast<DWORD>(wcslen(newline) * sizeof(wchar_t)), &written, nullptr);
+	try
+	{
+		if (!pszDebugMessage || cchDebugMessage == 0)
+			return;
+		// The callback is installed unconditionally (once per process) so the
+		// "Debug logging" setting can be toggled at runtime; the flag gates the
+		// actual write.
+		if (!g_debugLogging.load(std::memory_order_relaxed))
+			return;
+
+		std::lock_guard<std::mutex> lock(g_logMutex);
+		auto path = GetLogPath();
+		wil::unique_hfile hFile(CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+			nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+		if (!hFile)
+			return;
+		DWORD written = 0;
+		WriteFile(hFile.get(), pszDebugMessage, static_cast<DWORD>(cchDebugMessage * sizeof(wchar_t)), &written, nullptr);
+		static const wchar_t newline[] = L"\r\n";
+		WriteFile(hFile.get(), newline, static_cast<DWORD>(wcslen(newline) * sizeof(wchar_t)), &written, nullptr);
+	}
+	catch (...)
+	{
+		// Diagnostics must never take the process down.
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -75,15 +92,22 @@ bool IsAutoStartEnabled()
 	{
 		// Query the size first — the stored path may exceed MAX_PATH.
 		DWORD size = 0;
-		if (RegQueryValueExW(hKey, L"BTAudio", nullptr, nullptr, nullptr, &size) == ERROR_SUCCESS && size > 0)
+		DWORD type = 0;
+		if (RegQueryValueExW(hKey, L"BTAudio", nullptr, &type, nullptr, &size) == ERROR_SUCCESS && size > 0 &&
+			(type == REG_SZ || type == REG_EXPAND_SZ))
 		{
 			std::wstring path(size / sizeof(wchar_t), L'\0');
-			if (RegQueryValueExW(hKey, L"BTAudio", nullptr, nullptr,
+			if (RegQueryValueExW(hKey, L"BTAudio", nullptr, &type,
 				reinterpret_cast<LPBYTE>(path.data()), &size) == ERROR_SUCCESS)
 			{
 				RegCloseKey(hKey);
+				// The value is written quoted (see SetAutoStart); tolerate the
+				// bare path written by older versions and by installers.
+				std::wstring value(path.c_str()); // stops at the terminating NUL
+				if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"')
+					value = value.substr(1, value.size() - 2);
 				auto exePath = GetModuleFsPath(g_hInst).wstring();
-				return _wcsicmp(path.c_str(), exePath.c_str()) == 0;
+				return _wcsicmp(value.c_str(), exePath.c_str()) == 0;
 			}
 		}
 		RegCloseKey(hKey);
@@ -100,10 +124,13 @@ void SetAutoStart(bool enable)
 	{
 		if (enable)
 		{
+			// Quote the path: an unquoted Run value containing spaces makes the
+			// shell try "C:\Program.exe" before the real executable.
 			auto exePath = GetModuleFsPath(g_hInst).wstring();
+			std::wstring quoted = L"\"" + exePath + L"\"";
 			LOG_IF_WIN32_ERROR(RegSetValueExW(hKey, L"BTAudio", 0, REG_SZ,
-				reinterpret_cast<const BYTE*>(exePath.c_str()),
-				static_cast<DWORD>((exePath.size() + 1) * sizeof(wchar_t))));
+				reinterpret_cast<const BYTE*>(quoted.c_str()),
+				static_cast<DWORD>((quoted.size() + 1) * sizeof(wchar_t))));
 		}
 		else
 		{
@@ -170,21 +197,66 @@ int GetDeviceBatteryLevel(const std::wstring& deviceId)
 // Master volume helpers — control the default render endpoint (the device
 // BTAudio's audio actually plays through) via IAudioEndpointVolume. Returns
 // nullptr/-1 when no render endpoint exists.
+//
+// The endpoint object is cached: RefreshDeviceList used to create a fresh
+// MMDeviceEnumerator and activate IAudioEndpointVolume for every connected
+// device on EVERY watcher event (battery-level updates alone fire frequently),
+// which is a surprisingly expensive COM round-trip on the UI thread. The cached
+// object still reads the live value on every GetMasterVolumeLevelScalar call —
+// only the activation is cached — and the cache is invalidated whenever the
+// device set changes.
 // ---------------------------------------------------------------------------
+winrt::com_ptr<IAudioEndpointVolume> g_cachedEndpointVolume;
+ULONGLONG g_endpointVolumeResolvedAt = 0;
+ULONGLONG g_endpointVolumeRetryAt = 0;
+constexpr ULONGLONG ENDPOINT_CACHE_TTL_MS = 2000;
+constexpr ULONGLONG ENDPOINT_FAILURE_BACKOFF_MS = 5000;
+
+void InvalidateAudioEndpointCache()
+{
+	g_cachedEndpointVolume = nullptr;
+	g_endpointVolumeResolvedAt = 0;
+	g_endpointVolumeRetryAt = 0;
+}
+
 winrt::com_ptr<IAudioEndpointVolume> GetDefaultEndpointVolume()
 {
+	const ULONGLONG now = GetTickCount64();
+	if (g_cachedEndpointVolume)
+	{
+		if (now - g_endpointVolumeResolvedAt < ENDPOINT_CACHE_TTL_MS)
+			return g_cachedEndpointVolume;
+		g_cachedEndpointVolume = nullptr; // stale — re-resolve below
+	}
+	else if (now < g_endpointVolumeRetryAt)
+	{
+		// The audio stack just failed; do not hammer it on every refresh.
+		return nullptr;
+	}
+
 	winrt::com_ptr<IMMDeviceEnumerator> enumerator;
 	if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
 		__uuidof(IMMDeviceEnumerator), enumerator.put_void())))
 	{
+		g_endpointVolumeRetryAt = now + ENDPOINT_FAILURE_BACKOFF_MS;
 		return nullptr;
 	}
 	winrt::com_ptr<IMMDevice> device;
 	if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, device.put())))
+	{
+		g_endpointVolumeRetryAt = now + ENDPOINT_FAILURE_BACKOFF_MS;
 		return nullptr;
+	}
 	winrt::com_ptr<IAudioEndpointVolume> volume;
 	if (FAILED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, volume.put_void())))
+	{
+		g_endpointVolumeRetryAt = now + ENDPOINT_FAILURE_BACKOFF_MS;
 		return nullptr;
+	}
+
+	g_cachedEndpointVolume = volume;
+	g_endpointVolumeResolvedAt = now;
+	g_endpointVolumeRetryAt = 0;
 	return volume;
 }
 
@@ -229,15 +301,41 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	// simultaneously, which would create duplicate tray icons and conflict
 	// over the same settings file / Bluetooth connections.
 	HANDLE hSingleInstance = CreateMutexW(nullptr, TRUE, L"BTAudio_SingleInstance");
-	if (GetLastError() == ERROR_ALREADY_EXISTS)
+	const DWORD mutexError = GetLastError(); // must be read before any other call
+
+	// "Already running" means either the mutex existed (ERROR_ALREADY_EXISTS)
+	// or it is held by an instance at another integrity level, which makes
+	// CreateMutexW fail with ERROR_ACCESS_DENIED. Any OTHER CreateMutexW failure
+	// (handle exhaustion, out of memory) must NOT be mistaken for a running
+	// instance: that path used to exit silently, so double-clicking the exe did
+	// nothing at all. In that case we log and start without a guard.
+	const bool anotherInstanceRunning =
+		(hSingleInstance != nullptr && mutexError == ERROR_ALREADY_EXISTS) ||
+		(hSingleInstance == nullptr && mutexError == ERROR_ACCESS_DENIED);
+	if (anotherInstanceRunning)
 	{
 		if (hSingleInstance)
 			CloseHandle(hSingleInstance);
 		// Ask the running instance to bring up its main window instead of
 		// silently exiting (double-clicking the exe should feel responsive).
-		if (HWND hwnd = FindWindowW(L"BTAudio", nullptr))
-			PostMessageW(hwnd, WM_SHOWMAINWINDOW, 0, 0);
+		// The window may still be under construction on a cold start, so retry
+		// briefly before giving up.
+		for (int attempt = 0; attempt < 20; ++attempt)
+		{
+			if (HWND hwnd = FindWindowW(L"BTAudio", nullptr))
+			{
+				PostMessageW(hwnd, WM_SHOWMAINWINDOW, 0, 0);
+				return EXIT_SUCCESS;
+			}
+			Sleep(50);
+		}
 		return EXIT_SUCCESS;
+	}
+	if (!hSingleInstance)
+	{
+		// No single-instance protection available (out of handles / memory):
+		// log and keep going rather than refusing to start.
+		LOG_WIN32_MSG(mutexError, "CreateMutexW(BTAudio_SingleInstance) failed");
 	}
 
 	g_hInst = hInstance;
@@ -296,12 +394,17 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	// without this, every _(...) call falls back to the English source string.
 	// LoadSettings must run before it so the user's language preference
 	// (g_language) is known.
+	// Decide where BTAudio.json / BTAudio.log live (portable-first, with a
+	// %LOCALAPPDATA% fallback for read-only installs) before anything reads or
+	// writes the settings file.
+	ResolveDataDir();
 	LoadSettings();
 	LoadTranslateData();
 	// Attach the debug log callback once, at startup (SetResultMessageCallback
-	// may only be called once per process).
-	if (g_debugLogging)
-		wil::SetResultMessageCallback(DebugLogCallback);
+	// may only be called once per process). It is installed unconditionally so
+	// the "Debug logging" checkbox takes effect immediately; g_debugLogging
+	// gates the actual writes.
+	wil::SetResultMessageCallback(DebugLogCallback);
 	// Immediately sync the auto-start setting with the registry so that the
 	// Run key is always consistent with the persisted preference.
 	SetAutoStart(g_autoStart);
@@ -323,6 +426,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
 	LOG_LAST_ERROR_IF(WM_TASKBAR_CREATED == 0);
 
+	// A previous updater batch that could not replace the executable leaves a
+	// marker in %TEMP%. Surface it once instead of silently staying on the old
+	// version (the dialog is posted so it opens after the message loop starts).
+	if (ConsumeFailedUpdateMarker())
+		PostMessageW(g_hWnd, WM_UPDATEFAILED, 0, 0);
+
 	// Delay the initial reconnect to give Bluetooth services time to
 	// initialize. This is especially important when auto-starting with
 	// Windows, where the Bluetooth radio may not be ready at logon. Kept short:
@@ -334,25 +443,77 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	// Silently check for updates on startup.
 	CheckForUpdate(true);
 
-	MSG msg;
-	while (GetMessageW(&msg, nullptr, 0, 0))
+	// GetMessageW returns -1 on error; the old "while (GetMessageW(...))" loop
+	// treated that as success and dispatched an uninitialised MSG.
+	MSG msg{};
+	int getMessageResult = 0;
+	while ((getMessageResult = GetMessageW(&msg, nullptr, 0, 0)) > 0)
 	{
 		BOOL processed = FALSE;
-		winrt::check_hresult(desktopSourceNative2->PreTranslateMessage(&msg, &processed));
+		try
+		{
+			winrt::check_hresult(desktopSourceNative2->PreTranslateMessage(&msg, &processed));
+		}
+		catch (...)
+		{
+			// XAML input pre-processing must never take the app down — fall
+			// back to plain dispatch for this message.
+			LOG_CAUGHT_EXCEPTION();
+			processed = FALSE;
+		}
 		if (!processed)
 		{
 			TranslateMessage(&msg);
 			DispatchMessageW(&msg);
 		}
 	}
+	if (getMessageResult == -1)
+		LOG_LAST_ERROR();
 
 	return static_cast<int>(msg.wParam);
 }
 
+// ---------------------------------------------------------------------------
+// Window procedure — a thin exception boundary around HandleMessage.
+//
+// Several handlers call into WinRT (DeviceInformation::Update, the XAML tree in
+// RefreshDeviceList, theme/icon updates); those calls can fail with
+// RPC_E_DISCONNECTED after a Bluetooth-service restart or sleep/resume, and an
+// exception escaping into user32 terminates the process. Log and keep running
+// instead.
+// ---------------------------------------------------------------------------
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	try
+	{
+		return HandleMessage(hWnd, message, wParam, lParam);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+	catch (...)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+	// Never swallow the quit notification: an exception while tearing down must
+	// not leave an invisible process behind.
+	if (message == WM_DESTROY)
+		PostQuitMessage(0);
+	return 0;
+}
+
+LRESULT CALLBACK HandleMessage(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	switch (message)
 	{
+	case WM_CLOSE:
+		// Flush the debounced volume save and the current state before the
+		// window (and with it every timer) goes away.
+		KillTimer(g_hWnd, IDT_VOLUME_SAVE);
+		SaveSettings();
+		DestroyWindow(hWnd);
+		break;
 	case WM_DESTROY:
 		for (const auto& connection : g_audioPlaybackConnections)
 		{
@@ -394,7 +555,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (g_hIconDarkConnecting) { DestroyIcon(g_hIconDarkConnecting); g_hIconDarkConnecting = nullptr; }
 		if (g_hIconLightConnected) { DestroyIcon(g_hIconLightConnected); g_hIconLightConnected = nullptr; }
 		if (g_hIconDarkConnected) { DestroyIcon(g_hIconDarkConnected); g_hIconDarkConnected = nullptr; }
-		SetupSvgIcon();
+		try
+		{
+			SetupSvgIcon();
+		}
+		catch (...)
+		{
+			// D2D/SVG rendering failure must not kill the app on a DPI change;
+			// UpdateNotifyIcon falls back to the embedded .ico when the SVG
+			// icons are unavailable.
+			LOG_CAUGHT_EXCEPTION();
+		}
 		UpdateNotifyIcon();
 
 		if (g_mainWindowVisible && lParam)
@@ -483,8 +654,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			{
 				// A chain is already in flight for this device (manual click
 				// raced the queue) — skip it and pump the next queued device.
-				g_connectInProgress = false;
-				PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
+				EndSerialConnectChain();
 			}
 		}
 		break;
@@ -501,6 +671,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		DeviceInformation device(pUnknown, winrt::take_ownership_from_abi);
 		std::wstring id(device.Id());
 		g_availableDevices.emplace(id, std::move(device));
+		// New audio hardware may have become the default render endpoint.
+		InvalidateAudioEndpointCache();
 		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 		// If this device was pending (out-of-range at startup), let the
 		// UI thread promote it into the serial connect queue.
@@ -527,7 +699,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (!pId)
 			break;
 		if (g_availableDevices.erase(*pId) > 0)
+		{
+			InvalidateAudioEndpointCache();
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+		}
 		// Stop waiting for a device that has left range entirely.
 		g_pendingConnectOnAppear.erase(*pId);
 		// The device is gone from the system (unpaired / interface removed) —
@@ -569,6 +744,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			catch (...)
 			{
 				LOG_CAUGHT_EXCEPTION();
+				// Never leave the serial pump waiting for a chain that died
+				// before it could report back.
+				if (pInfo->notifyNextOnComplete)
+					EndSerialConnectChain();
 			}
 		}
 	}
@@ -683,11 +862,12 @@ void SetupSettingsFlyout()
 	});
 
 	g_settingsDebugLoggingCheckbox = CheckBox();
-	g_settingsDebugLoggingCheckbox.IsChecked(g_debugLogging);
+	g_settingsDebugLoggingCheckbox.IsChecked(g_debugLogging.load());
 	g_settingsDebugLoggingCheckbox.Content(winrt::box_value(_(L"Debug logging")));
 	g_settingsDebugLoggingCheckbox.Margin({ 0, 0, 0, 12 });
 	g_settingsDebugLoggingCheckbox.Click([](const auto&, const auto&) {
-		g_debugLogging = g_settingsDebugLoggingCheckbox.IsChecked().Value();
+		// The wil callback is always installed, so this takes effect at once.
+		g_debugLogging.store(g_settingsDebugLoggingCheckbox.IsChecked().Value());
 		SaveSettings();
 	});
 
@@ -800,15 +980,7 @@ void SetupMenu()
 			return;
 		}
 
-		g_mainWindowVisible = false;
-
-		RECT iconRect = GetTrayIconRect();
-		auto dpi = GetDpiForWindow(g_hWnd);
-
-		SetWindowPos(g_hWnd, HWND_TOPMOST, iconRect.left, iconRect.top, 0, 0, SWP_HIDEWINDOW);
-		g_xamlCanvas.Width(static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi));
-		g_xamlCanvas.Height(static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi));
-
+		PrepareFlyoutAnchor(GetTrayIconRect());
 		g_xamlFlyout.ShowAt(g_xamlCanvas);
 	});
 
@@ -848,28 +1020,24 @@ VOID CALLBACK ReconnectTimerProc(HWND hwnd, UINT, UINT_PTR idEvent, DWORD)
 {
 	KillTimer(hwnd, idEvent);
 	auto it = g_pendingReconnects.find(idEvent);
-	if (it != g_pendingReconnects.end())
+	if (it == g_pendingReconnects.end())
+		return;
+
+	PendingReconnect pr = std::move(it->second);
+	g_pendingReconnects.erase(it);
+	// Continue the SAME chain: the "connecting" entry is kept alive across the
+	// backoff (it carries the chain id and the display name), so nothing is
+	// erased here. StartConnect validates that the entry still belongs to this
+	// chain and refuses to restart a chain that was cancelled or superseded in
+	// the meantime. deviceId is moved into the coroutine frame, so it stays
+	// valid across the suspension points inside ConnectDevice.
+	if (!StartConnect(std::move(pr.deviceId), pr.retryCount, pr.attempt, pr.isAutoReconnect,
+		pr.notifyNextOnComplete, pr.autoReconnectDeadline, pr.chainId))
 	{
-		PendingReconnect pr = std::move(it->second);
-		g_pendingReconnects.erase(it);
-		// Lift the re-entrancy guard in StartConnect: the "connecting" entry
-		// was only kept around to render the Connecting state during the
-		// backoff — StartConnect re-adds it immediately. deviceId is moved
-		// into the coroutine frame (passed by value), so it is safe across the
-		// suspension points inside ConnectDevice even though this stack frame
-		// returns immediately afterwards.
-		g_connectingDevices.erase(pr.deviceId);
-		if (!StartConnect(std::move(pr.deviceId), pr.retryCount, pr.attempt, pr.isAutoReconnect, pr.notifyNextOnComplete, pr.autoReconnectDeadline))
-		{
-			// A different chain is already connecting this device (manual
-			// click / auto-reconnect race) — this chain gives up. Keep the
-			// serial pump moving if this was a queued startup connect.
-			if (pr.notifyNextOnComplete)
-			{
-				g_connectInProgress = false;
-				PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
-			}
-		}
+		// This chain no longer owns the device (removed / cancelled) — keep the
+		// serial pump moving if this was a queued startup connect.
+		if (pr.notifyNextOnComplete)
+			EndSerialConnectChain();
 	}
 }
 
@@ -883,7 +1051,9 @@ UINT ComputeReconnectDelay(int attempt, bool isAutoReconnect)
 
 	if (isAutoReconnect)
 	{
-		// Link-drop auto-reconnect: 1s, 2s, 4s, 8s, 16s, 30s, 30s, 30s ...
+		// Link-drop auto-reconnect. Callers pass the index of the UPCOMING
+		// attempt (attempt + 1), so the first retry waits 2s: 2, 4, 8, 16, 30,
+		// 30, ... (12 retries ≈ 4.5 minutes).
 		constexpr UINT baseDelay = 1000;
 		constexpr UINT maxDelay = 30000;
 		UINT delay = baseDelay;
@@ -940,6 +1110,26 @@ UINT_PTR AllocateReconnectTimerId()
 	return 0;
 }
 
+// Connect-chain identities: a monotonically increasing counter owned by the UI
+// thread. 0 is reserved for "start a new chain" / "no chain".
+uint64_t g_nextChainId = 0;
+
+uint64_t AllocateChainId()
+{
+	return ++g_nextChainId;
+}
+
+// Finish the serial (startup) connect chain currently in flight and pump the
+// next queued device. Idempotent — safe to call from every terminal path,
+// including a cancelled/removed device whose pending timer was killed.
+void EndSerialConnectChain()
+{
+	if (!g_connectInProgress)
+		return;
+	g_connectInProgress = false;
+	PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
+}
+
 // ---------------------------------------------------------------------------
 // StartConnect — UI-thread entry point for a connect attempt chain. Marks the
 // device as "connecting" (so the available list shows progress immediately,
@@ -948,44 +1138,101 @@ UINT_PTR AllocateReconnectTimerId()
 // continuation: everything after co_await runs on a thread-pool thread, so the
 // "connecting" bookkeeping belongs here, on the UI thread.
 //
-// Re-entrancy: returns false without starting anything if a chain is already
-// in flight for this device (i.e. it is in g_connectingDevices). Two
-// concurrent chains for one device race over the radio and — worse — the
-// failing chain's result used to tear down the healthy connection the other
-// chain had just established. Callers that legitimately restart a chain
-// (ReconnectTimerProc) erase the "connecting" entry first.
+// Re-entrancy: a device is owned by at most ONE chain. chainId == 0 starts a
+// new chain and is refused with false when an entry already exists; a non-zero
+// chainId continues an existing chain and is refused when the entry is gone
+// (cancelled / device removed) or belongs to a different chain. Two concurrent
+// chains for one device race over the radio and — worse — the failing chain's
+// result used to tear down the healthy connection the other chain had just
+// established.
 // ---------------------------------------------------------------------------
-bool StartConnect(const std::wstring& deviceId, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
+bool StartConnect(const std::wstring& deviceId, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline, uint64_t chainId)
 {
-	// Re-entrancy guard — see the comment above.
-	if (g_connectingDevices.find(deviceId) != g_connectingDevices.end())
-		return false;
+	auto existing = g_connectingDevices.find(deviceId);
+	if (chainId == 0)
+	{
+		if (existing != g_connectingDevices.end())
+			return false; // another chain already owns this device
+	}
+	else if (existing == g_connectingDevices.end() || existing->second.chainId != chainId)
+	{
+		return false; // this chain was cancelled or superseded
+	}
+
 	// Best-effort real name from the watcher list for the connecting status.
-	// The coroutine reports the authoritative name back via WM_CONNECTRESULT,
-	// which re-fills g_connectingDevices on retries.
+	// The coroutine reports the authoritative name back via WM_CONNECTRESULT.
 	std::wstring deviceName;
 	auto dit = g_availableDevices.find(deviceId);
 	if (dit != g_availableDevices.end())
 		deviceName = std::wstring(dit->second.Name());
-	g_connectingDevices.emplace(deviceId, deviceName);
+
+	ConnectingEntry& entry = g_connectingDevices[deviceId];
+	if (chainId == 0)
+	{
+		chainId = AllocateChainId();
+		entry.name.clear();
+	}
+	entry.chainId = chainId;
+	entry.isAutoReconnect = isAutoReconnect;
+	if (!deviceName.empty())
+		entry.name = std::move(deviceName);
+
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
-	ConnectDevice(deviceId, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline);
+	ConnectDevice(deviceId, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline, chainId);
 	return true;
 }
 
-bool StartConnect(const DeviceInformation& device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
+bool StartConnect(const DeviceInformation& device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline, uint64_t chainId)
 {
-	// Re-entrancy guard — see the comment above.
 	const std::wstring id(device.Id());
-	if (g_connectingDevices.find(id) != g_connectingDevices.end())
-		return false;
-	g_connectingDevices.emplace(id, std::wstring(device.Name()));
+	auto existing = g_connectingDevices.find(id);
+	if (chainId == 0)
+	{
+		if (existing != g_connectingDevices.end())
+			return false; // another chain already owns this device
+	}
+	else if (existing == g_connectingDevices.end() || existing->second.chainId != chainId)
+	{
+		return false; // this chain was cancelled or superseded
+	}
+
+	ConnectingEntry& entry = g_connectingDevices[id];
+	if (chainId == 0)
+		chainId = AllocateChainId();
+	entry.chainId = chainId;
+	entry.isAutoReconnect = isAutoReconnect;
+	entry.name = std::wstring(device.Name());
+
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
-	ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline);
+	ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline, chainId);
 	return true;
 }
 
-winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
+// Format "<message> (0xXXXXXXXX)" with a bounded growth loop. swprintf returns
+// -1 both when the buffer is too small AND on encoding failures (e.g. a lone
+// surrogate in the WinRT message), so an unbounded "double the buffer and
+// retry" loop could spin until bad_alloc instead of producing a message.
+std::wstring FormatHresultError(const winrt::hresult_error& ex)
+{
+	constexpr size_t maxLength = 16 * 1024;
+	std::wstring text(128, L'\0');
+	for (;;)
+	{
+		const int written = swprintf(text.data(), text.size(), L"%s (0x%08X)",
+			ex.message().c_str(), static_cast<uint32_t>(ex.code()));
+		if (written >= 0)
+		{
+			text.resize(static_cast<size_t>(written));
+			return text;
+		}
+		if (text.size() >= maxLength)
+			break;
+		text.resize(text.size() * 2);
+	}
+	return std::wstring(ex.message());
+}
+
+winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline, uint64_t chainId)
 {
 	// NOTE — coroutine threading model: this coroutine resumes on a thread-pool
 	// thread after every co_await (the app runs in an MTA), so it MUST NOT read
@@ -1003,6 +1250,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 	info.isAutoReconnect = isAutoReconnect;
 	info.notifyNextOnComplete = notifyNextOnComplete;
 	info.autoReconnectDeadline = autoReconnectDeadline;
+	info.chainId = chainId;
 
 	// Declared outside the try so the failure teardown below can Close it even
 	// when StartAsync / OpenAsync threw.
@@ -1068,7 +1316,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 					auto n = swprintf(info.errorMessage.data(), info.errorMessage.size(),
 						L"%ls (0x%08X)", _(L"Unknown failure"),
 						static_cast<uint32_t>(hr));
-					if (n > 0)
+					if (n >= 0)
 						info.errorMessage.resize(n);
 					else
 						info.errorMessage = _(L"Unknown failure");
@@ -1087,20 +1335,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 		// ready at logon, stack busy after sleep/resume) — route them through
 		// the unified retry path instead of failing the chain outright.
 		info.shouldRetry = true;
-		info.errorMessage.resize(64);
-		while (1)
-		{
-			auto result = swprintf(info.errorMessage.data(), info.errorMessage.size(), L"%s (0x%08X)", ex.message().c_str(), static_cast<uint32_t>(ex.code()));
-			if (result < 0)
-			{
-				info.errorMessage.resize(info.errorMessage.size() * 2);
-			}
-			else
-			{
-				info.errorMessage.resize(result);
-				break;
-			}
-		}
+		info.errorMessage = FormatHresultError(ex);
 		LOG_CAUGHT_EXCEPTION();
 	}
 
@@ -1125,14 +1360,14 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline)
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int attempt, bool isAutoReconnect, bool notifyNextOnComplete, ULONGLONG autoReconnectDeadline, uint64_t chainId)
 {
 	// deviceId is owned by the coroutine frame (passed by value), so it remains
 	// valid across the suspension point below.
 	try
 	{
 		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
-		ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline);
+		ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline, chainId);
 	}
 	catch (winrt::hresult_error const& ex)
 	{
@@ -1151,14 +1386,9 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int 
 		info.isAutoReconnect = isAutoReconnect;
 		info.notifyNextOnComplete = notifyNextOnComplete;
 		info.autoReconnectDeadline = autoReconnectDeadline;
+		info.chainId = chainId;
 		info.shouldRetry = true; // the enumeration failure may be transient
-		info.errorMessage.resize(64);
-		auto n = swprintf(info.errorMessage.data(), info.errorMessage.size(),
-			L"%ls (0x%08X)", ex.message().c_str(), static_cast<uint32_t>(ex.code()));
-		if (n > 0)
-			info.errorMessage.resize(n);
-		else
-			info.errorMessage = std::wstring(ex.message());
+		info.errorMessage = FormatHresultError(ex);
 		auto* pInfo = new ConnectResultInfo(std::move(info));
 		if (!PostMessageW(g_hWnd, WM_CONNECTRESULT, reinterpret_cast<WPARAM>(pInfo), 0))
 		{
@@ -1174,32 +1404,48 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int 
 // ---------------------------------------------------------------------------
 void HandleConnectResult(ConnectResultInfo& info)
 {
+	// Chain ownership: this result only applies while the "connecting" entry
+	// still belongs to the chain that produced it. A different chain id (the
+	// device was cancelled / removed / re-connected meanwhile) means the
+	// result is stale and must not touch the shared state.
+	auto entryIt = g_connectingDevices.find(info.deviceId);
+	const bool ownsChain =
+		entryIt != g_connectingDevices.end() && entryIt->second.chainId == info.chainId;
+
+	// Display-name fallback chain for the notifications below: the name the
+	// coroutine reported (authoritative once the device was opened) -> the name
+	// captured when the chain started -> the watcher's name -> the raw id.
+	// Without this, a chain whose CreateFromIdAsync failed produced messages
+	// that started with "— Reconnect failed".
+	std::wstring displayName = info.deviceName;
+	if (displayName.empty() && entryIt != g_connectingDevices.end())
+		displayName = entryIt->second.name;
+	if (displayName.empty())
+	{
+		auto dit = g_availableDevices.find(info.deviceId);
+		if (dit != g_availableDevices.end())
+			displayName = std::wstring(dit->second.Name());
+	}
+	if (displayName.empty())
+		displayName = info.deviceId;
+
 	if (info.success)
 	{
-		// Connecting phase is over regardless of outcome — drop the
-		// "connecting" status (mirrors the failure branch below).
-		g_connectingDevices.erase(info.deviceId);
-		// If the user cancelled the auto-reconnect while we were awaiting the
-		// async operation, honor the cancellation even though the link came up:
-		// close the fresh connection and persist the reduced device list. The
-		// device is NOT in g_audioPlaybackConnections here (the cancellation /
-		// teardown path removed it), so Close() only needs the fresh object.
-		if (info.isAutoReconnect &&
-			g_autoReconnectingDevices.find(info.deviceId) == g_autoReconnectingDevices.end())
+		if (!ownsChain)
 		{
+			// The chain was cancelled / superseded while the async open was in
+			// flight — honour the cancellation even though the link came up,
+			// and persist the reduced device list so a crash/forced exit does
+			// not reconnect a device the user explicitly cancelled.
 			info.connection.Close();
-			// Persist so a crash/forced exit does not reconnect a device the
-			// user explicitly cancelled.
 			SaveSettings();
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 			UpdateNotifyIcon();
 			if (info.notifyNextOnComplete)
-			{
-				g_connectInProgress = false;
-				PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
-			}
+				EndSerialConnectChain();
 			return;
 		}
+		g_connectingDevices.erase(entryIt);
 
 		// Avoid duplicate connections to the same device. Remove the old entry
 		// BEFORE Close() so its StateChanged(Closed) is treated as a
@@ -1213,6 +1459,10 @@ void HandleConnectResult(ConnectResultInfo& info)
 			oldConnection.Close();
 		}
 		g_audioPlaybackConnections.emplace(info.deviceId, std::pair(info.device, info.connection));
+
+		// A new A2DP sink is up: the default render endpoint may have changed,
+		// so drop the cached IAudioEndpointVolume before touching the volume.
+		InvalidateAudioEndpointCache();
 
 		// Restore the remembered volume for this device (best effort — no
 		// render endpoint means GetMasterVolume/SetMasterVolume are no-ops).
@@ -1228,16 +1478,24 @@ void HandleConnectResult(ConnectResultInfo& info)
 		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 		UpdateNotifyIcon();
 		if (info.notifyNextOnComplete)
-		{
-			g_connectInProgress = false;
-			PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
-		}
+			EndSerialConnectChain();
 		return;
 	}
 
 	// ---- Failure ----
-	// Connecting phase is over regardless of outcome.
-	g_connectingDevices.erase(info.deviceId);
+	if (!ownsChain)
+	{
+		// Cancelled / superseded (device removed, user pressed Cancel, a newer
+		// chain took over, ...): this chain owns neither the "connecting" entry
+		// nor a retry budget any more. Just refresh so a stale spinner goes
+		// away, and let the serial pump move on if this was a startup attempt.
+		PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
+		UpdateNotifyIcon();
+		if (info.notifyNextOnComplete)
+			EndSerialConnectChain();
+		return;
+	}
+
 	// NOTE: this chain did NOT establish a connection, so it must not touch
 	// g_audioPlaybackConnections. If an entry exists here it belongs to a
 	// healthy connection opened by a concurrent chain — the old "defensive
@@ -1252,47 +1510,45 @@ void HandleConnectResult(ConnectResultInfo& info)
 	// single-threaded. Auto-reconnect uses a gentler curve than manual.
 	if (info.shouldRetry && info.retryCount > 0)
 	{
-		// Check if the auto-reconnect was cancelled by the user while we were
-		// awaiting the async operation.
+		// Check if the auto-reconnect was cancelled while we were awaiting the
+		// async operation (CancelReconnect also erases the entry, so this is a
+		// safety net for a cancellation that raced the ownership snapshot).
 		if (info.isAutoReconnect &&
 			g_autoReconnectingDevices.find(info.deviceId) == g_autoReconnectingDevices.end())
 		{
-			if (info.notifyNextOnComplete)
-			{
-				g_connectInProgress = false;
-				PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
-			}
+			g_connectingDevices.erase(entryIt);
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 			UpdateNotifyIcon();
+			if (info.notifyNextOnComplete)
+				EndSerialConnectChain();
 			return;
 		}
 		// Check if the auto-reconnect wall-clock timeout has been exceeded.
 		if (info.isAutoReconnect && info.autoReconnectDeadline > 0 &&
 			GetTickCount64() >= info.autoReconnectDeadline)
 		{
+			g_connectingDevices.erase(entryIt);
 			g_autoReconnectingDevices.erase(info.deviceId);
-			if (info.notifyNextOnComplete)
-			{
-				g_connectInProgress = false;
-				PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
-			}
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 			UpdateNotifyIcon();
+			if (info.notifyNextOnComplete)
+				EndSerialConnectChain();
 			return;
 		}
 		const int nextAttempt = info.attempt + 1;
 		const UINT delay = ComputeReconnectDelay(nextAttempt, info.isAutoReconnect);
-		// Keep showing the "Connecting" state while we wait out the backoff.
-		// Never clobber an existing name with an empty one — a chain whose
-		// CreateFromIdAsync failed has no name to report.
+		// Keep showing the "Connecting" state while we wait out the backoff —
+		// the entry stays alive with the SAME chain id so the timer resumes this
+		// chain and only this chain. Never clobber a known name with an empty
+		// one: a chain whose CreateFromIdAsync failed has no name to report.
+		entryIt->second.chainId = info.chainId;
+		entryIt->second.isAutoReconnect = info.isAutoReconnect;
 		if (!info.deviceName.empty())
-			g_connectingDevices.insert_or_assign(info.deviceId, info.deviceName);
-		else
-			g_connectingDevices.emplace(info.deviceId, info.deviceName);
+			entryIt->second.name = info.deviceName;
 		if (UINT_PTR timerId = AllocateReconnectTimerId();
 			timerId && SetTimer(g_hWnd, timerId, delay, ReconnectTimerProc))
 		{
-			g_pendingReconnects[timerId] = { info.deviceId, info.retryCount - 1, nextAttempt, info.isAutoReconnect, info.notifyNextOnComplete, info.autoReconnectDeadline };
+			g_pendingReconnects[timerId] = { info.deviceId, info.retryCount - 1, nextAttempt, info.isAutoReconnect, info.notifyNextOnComplete, info.autoReconnectDeadline, info.chainId };
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 			UpdateNotifyIcon();
 			return;
@@ -1300,19 +1556,22 @@ void HandleConnectResult(ConnectResultInfo& info)
 		// SetTimer failed (timer resources exhausted) — treat this as a final
 		// failure so the serial pump keeps moving instead of deadlocking
 		// g_connectInProgress with WM_CONNECTNEXT never re-posted.
-		g_connectingDevices.erase(info.deviceId);
+		g_connectingDevices.erase(entryIt);
 	}
 
-	// Auto-reconnect chain ended without success (exhausted retries or
-	// non-retryable failure). Clear the tracking so the UI drops the "Cancel"
-	// button, and notify the user. A device that vanished entirely (empty
-	// errorMessage, e.g. CreateFromIdAsync failed) stays silent.
+	// ---- Final failure (retries exhausted / non-retryable) ----
+	// The connecting phase is over — drop the entry so the spinner goes away.
+	g_connectingDevices.erase(info.deviceId);
+
+	// Auto-reconnect chain ended without success. Clear the tracking so the UI
+	// drops the "Cancel" button, and notify the user. A device that vanished
+	// entirely (empty errorMessage, e.g. CreateFromIdAsync failed) stays silent.
 	if (info.isAutoReconnect)
 	{
 		g_autoReconnectingDevices.erase(info.deviceId);
 		if (!info.errorMessage.empty())
 		{
-			std::wstring text = GetDeviceDisplayName(info.deviceId, info.deviceName) +
+			std::wstring text = GetDeviceDisplayName(info.deviceId, displayName) +
 				L" — " + _(L"Reconnect failed");
 			ShowTrayNotification(L"BTAudio", text.c_str());
 		}
@@ -1324,7 +1583,7 @@ void HandleConnectResult(ConnectResultInfo& info)
 	// notification, reusing the already-translated "Reconnect failed" string.
 	if (!info.isAutoReconnect && info.notifyNextOnComplete && !info.errorMessage.empty())
 	{
-		std::wstring text = GetDeviceDisplayName(info.deviceId, info.deviceName) +
+		std::wstring text = GetDeviceDisplayName(info.deviceId, displayName) +
 			L" — " + _(L"Reconnect failed");
 		ShowTrayNotification(L"BTAudio", text.c_str());
 	}
@@ -1333,7 +1592,7 @@ void HandleConnectResult(ConnectResultInfo& info)
 	// tray notification (above), so the user is not spammed by modal dialogs.
 	if (!info.isAutoReconnect && !info.notifyNextOnComplete && !info.errorMessage.empty())
 	{
-		std::wstring content = GetDeviceDisplayName(info.deviceId, info.deviceName) +
+		std::wstring content = GetDeviceDisplayName(info.deviceId, displayName) +
 			L"\n" + info.errorMessage;
 		TaskDialog(g_hWnd, nullptr, L"BTAudio",
 			_(L"Failed to connect to device"), content.c_str(),
@@ -1345,10 +1604,7 @@ void HandleConnectResult(ConnectResultInfo& info)
 	// retry branch above returns early without reaching here, so this only
 	// fires once the whole attempt chain (including retries) has settled.
 	if (info.notifyNextOnComplete)
-	{
-		g_connectInProgress = false;
-		PostMessageW(g_hWnd, WM_CONNECTNEXT, 0, 0);
-	}
+		EndSerialConnectChain();
 }
 
 // Process a Closed notification posted from the AudioPlaybackConnection
@@ -1374,12 +1630,28 @@ void HandleDeviceClosed(const std::wstring& deviceId, void* connectionAbiPtr)
 		return;
 
 	std::wstring deviceName(GetDeviceDisplayName(deviceId, it->second.first.Name()));
-	// Erase the stale connection object first; the AutoReconnect below will
-	// create a fresh one if it succeeds.
+	// Erase the stale connection object first; the auto-reconnect below will
+	// create a fresh one if it succeeds. The A2DP sink endpoint is gone, so the
+	// cached IAudioEndpointVolume no longer points at the right device.
 	g_audioPlaybackConnections.erase(it);
-	g_connectingDevices.erase(deviceId);
+	InvalidateAudioEndpointCache();
+	// Do NOT erase g_connectingDevices[deviceId] here: if a connect chain is
+	// already running for this device (manual click / startup reconnect), that
+	// chain owns the entry. Clearing it from the link-drop path allowed a
+	// second chain to start, and the two then raced over the radio and left
+	// stale entries in g_autoReconnectingDevices.
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 	UpdateNotifyIcon();
+	// Persist the reduced list immediately so a crash / forced exit does not
+	// reconnect a device whose link already dropped.
+	SaveSettings();
+
+	if (g_connectingDevices.find(deviceId) != g_connectingDevices.end())
+	{
+		// A chain is already in flight for this device — let it establish the
+		// connection instead of starting a competing one.
+		return;
+	}
 
 	// Kick off an automatic reconnect with a larger retry budget and gentler
 	// exponential backoff so a briefly-out-of-range / sleeping device gets a
@@ -1394,8 +1666,13 @@ void HandleDeviceClosed(const std::wstring& deviceId, void* connectionAbiPtr)
 	std::wstring text = (deviceName.empty() ? deviceId : deviceName) +
 		L" — " + _(L"Disconnected, reconnecting...");
 	ShowTrayNotification(L"BTAudio", text.c_str());
-	StartConnect(deviceId, AUTO_RECONNECT_RETRY_COUNT, 0, true, false,
-		GetTickCount64() + AUTO_RECONNECT_TIMEOUT_MS);
+	if (!StartConnect(deviceId, AUTO_RECONNECT_RETRY_COUNT, 0, true, false,
+		GetTickCount64() + AUTO_RECONNECT_TIMEOUT_MS))
+	{
+		// Defensive: do not leave a "reconnecting" marker behind without a
+		// chain to clear it.
+		g_autoReconnectingDevices.erase(deviceId);
+	}
 }
 
 // Reconcile g_pendingConnectOnAppear against the devices the watcher has now
@@ -1436,16 +1713,23 @@ void HandleDeviceAppeared()
 // UI so the device reappears in the available list with a Connect button.
 //
 // Note: if a ConnectDevice coroutine is currently awaiting StartAsync/OpenAsync,
-// the cancellation is detected when that async call returns — the coroutine
-// checks g_autoReconnectingDevices before scheduling the next retry.
+// the cancellation is detected when its result arrives — HandleConnectResult
+// compares the chain id and drops the result (closing a connection that came up
+// after the cancellation).
 // ---------------------------------------------------------------------------
 void CancelReconnect(const std::wstring& deviceId)
 {
-	// Kill any pending reconnect timer for this device.
+	// Kill any pending reconnect timer for this device. A killed timer that
+	// belonged to the serial (startup) chain must also release the pump:
+	// otherwise g_connectInProgress stays true forever and every later queued
+	// device (including ones promoted by WM_DEVICEAPPEARED) is never connected.
+	bool endedSerialChain = false;
 	for (auto it = g_pendingReconnects.begin(); it != g_pendingReconnects.end(); )
 	{
 		if (it->second.deviceId == deviceId)
 		{
+			if (it->second.notifyNextOnComplete)
+				endedSerialChain = true;
 			KillTimer(g_hWnd, it->first);
 			it = g_pendingReconnects.erase(it);
 		}
@@ -1456,6 +1740,12 @@ void CancelReconnect(const std::wstring& deviceId)
 	}
 	g_connectingDevices.erase(deviceId);
 	g_autoReconnectingDevices.erase(deviceId);
+	g_lowBatteryNotified.erase(deviceId);
+	if (endedSerialChain)
+		EndSerialConnectChain();
+	// Persist the reduced device list so a crash / forced exit does not
+	// reconnect a device the user explicitly cancelled.
+	SaveSettings();
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 	UpdateNotifyIcon();
 }
@@ -1487,8 +1777,15 @@ VOID CALLBACK WatcherPollTimerProc(HWND, UINT, UINT_PTR, DWORD)
 {
 	try
 	{
-		if (g_deviceWatcher &&
-			g_deviceWatcher.Status() == DeviceWatcherStatus::Aborted)
+		// No watcher at all means a previous (re)build failed. Retry it on the
+		// next poll instead of leaving the device list frozen for the rest of
+		// the process lifetime (the poll interval doubles as the retry cooldown).
+		if (!g_deviceWatcher)
+		{
+			RestartDeviceWatcher();
+			return;
+		}
+		if (g_deviceWatcher.Status() == DeviceWatcherStatus::Aborted)
 			RestartDeviceWatcher();
 	}
 	catch (...)
@@ -1497,55 +1794,68 @@ VOID CALLBACK WatcherPollTimerProc(HWND, UINT, UINT_PTR, DWORD)
 	}
 }
 
-void SetupDeviceWatcher()
+bool SetupDeviceWatcher()
 {
-	// Use the A2DP sink device selector so the watcher surfaces exactly the
-	// devices that AudioPlaybackConnection can use.
-	auto selector = AudioPlaybackConnection::GetDeviceSelector();
+	try
+	{
+		// Use the A2DP sink device selector so the watcher surfaces exactly the
+		// devices that AudioPlaybackConnection can use.
+		auto selector = AudioPlaybackConnection::GetDeviceSelector();
 
-	// Request the battery-level property so we can display it in the UI.
-	// DEVPKEY_Device_BatteryLevel = {104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2
-	auto additionalProperties = winrt::single_threaded_vector<winrt::hstring>({
-		L"{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2"
-	});
-	g_deviceWatcher = DeviceInformation::CreateWatcher(selector, additionalProperties);
+		// Request the battery-level property so we can display it in the UI.
+		// DEVPKEY_Device_BatteryLevel = {104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2
+		auto additionalProperties = winrt::single_threaded_vector<winrt::hstring>({
+			L"{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2"
+		});
+		g_deviceWatcher = DeviceInformation::CreateWatcher(selector, additionalProperties);
 
-	// The watcher callbacks may fire on an arbitrary thread (desktop apps run
-	// in an MTA), so they only forward heap-allocated payloads to the UI
-	// thread — all map bookkeeping happens in WndProc on the UI thread.
-	g_deviceWatcher.Added([](const auto&, const DeviceInformation& device) {
-		// Forward a strong reference to the projected object: AddRef before
-		// posting, the UI thread takes ownership (take_ownership_from_abi).
-		auto* pUnknown = winrt::get_unknown(device);
-		pUnknown->AddRef();
-		if (!PostMessageW(g_hWnd, WM_DEVICEADDED,
-			reinterpret_cast<WPARAM>(pUnknown), 0))
-		{
-			pUnknown->Release(); // queue full / window gone — free locally
-		}
-	});
-	g_deviceWatcher.Updated([](const auto&, const DeviceInformationUpdate& update) {
-		auto* pUnknown = winrt::get_unknown(update);
-		pUnknown->AddRef();
-		if (!PostMessageW(g_hWnd, WM_DEVICEUPDATED,
-			reinterpret_cast<WPARAM>(pUnknown), 0))
-		{
-			pUnknown->Release(); // queue full / window gone — free locally
-		}
-	});
-	g_deviceWatcher.Removed([](const auto&, const DeviceInformationUpdate& update) {
-		auto* pId = new std::wstring(update.Id());
-		if (!PostMessageW(g_hWnd, WM_DEVICEREMOVED,
-			reinterpret_cast<WPARAM>(pId), 0))
-		{
-			delete pId; // queue full / window gone — free locally
-		}
-	});
+		// The watcher callbacks may fire on an arbitrary thread (desktop apps run
+		// in an MTA), so they only forward heap-allocated payloads to the UI
+		// thread — all map bookkeeping happens in WndProc on the UI thread.
+		g_deviceWatcher.Added([](const auto&, const DeviceInformation& device) {
+			// Forward a strong reference to the projected object: AddRef before
+			// posting, the UI thread takes ownership (take_ownership_from_abi).
+			auto* pUnknown = winrt::get_unknown(device);
+			pUnknown->AddRef();
+			if (!PostMessageW(g_hWnd, WM_DEVICEADDED,
+				reinterpret_cast<WPARAM>(pUnknown), 0))
+			{
+				pUnknown->Release(); // queue full / window gone — free locally
+			}
+		});
+		g_deviceWatcher.Updated([](const auto&, const DeviceInformationUpdate& update) {
+			auto* pUnknown = winrt::get_unknown(update);
+			pUnknown->AddRef();
+			if (!PostMessageW(g_hWnd, WM_DEVICEUPDATED,
+				reinterpret_cast<WPARAM>(pUnknown), 0))
+			{
+				pUnknown->Release(); // queue full / window gone — free locally
+			}
+		});
+		g_deviceWatcher.Removed([](const auto&, const DeviceInformationUpdate& update) {
+			auto* pId = new std::wstring(update.Id());
+			if (!PostMessageW(g_hWnd, WM_DEVICEREMOVED,
+				reinterpret_cast<WPARAM>(pId), 0))
+			{
+				delete pId; // queue full / window gone — free locally
+			}
+		});
 
-	// NOTE: watcher aborts are NOT detected here — DeviceWatcher::StatusChanged
-	// is not exposed by the C++/WinRT projection of recent Windows SDKs.
-	// Detection is done by WatcherPollTimerProc (polls Status() instead).
-	g_deviceWatcher.Start();
+		// NOTE: watcher aborts are NOT detected here — DeviceWatcher::StatusChanged
+		// is not exposed by the C++/WinRT projection of recent Windows SDKs.
+		// Detection is done by WatcherPollTimerProc (polls Status() instead).
+		g_deviceWatcher.Start();
+		return true;
+	}
+	catch (...)
+	{
+		// Creating/starting a watcher can fail when the Bluetooth/device
+		// enumeration service is down (or the per-process watcher limit is
+		// hit). Leave g_deviceWatcher null so the poll timer retries.
+		LOG_CAUGHT_EXCEPTION();
+		g_deviceWatcher = nullptr;
+		return false;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1576,9 +1886,11 @@ void RestartDeviceWatcher()
 		g_deviceWatcher = nullptr;
 	}
 	// The fresh watcher's initial enumeration re-reports every device, so the
-	// stale cache can simply be dropped (WM_DEVICEADDED refills it).
-	g_availableDevices.clear();
-	SetupDeviceWatcher();
+	// stale cache can simply be dropped (WM_DEVICEADDED refills it). Only drop
+	// it once the replacement watcher is actually running: a failed rebuild
+	// keeps the last known list on screen until the next poll retries.
+	if (SetupDeviceWatcher())
+		g_availableDevices.clear();
 	PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 }
 
@@ -1708,26 +2020,33 @@ void UpdateNotifyIcon()
 	else
 		g_nid.hIcon = isLight ? g_hIconLight : g_hIconDark;
 
-	// Update tooltip with the first connected / connecting device name
+	// Fallback when SVG rendering is unavailable (e.g. a D2D failure while
+	// re-rendering on a DPI change): keep a tray icon instead of a blank slot.
+	if (!g_nid.hIcon)
+		g_nid.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_BTAUDIO));
+
+	// Update tooltip with the first connected / connecting device name.
+	// StringCchPrintf truncates instead of failing, so a long device alias can
+	// never leave a stale tooltip behind (swprintf_s returned -1 on overflow).
 	if (hasConnection)
 	{
 		auto connIt = g_audioPlaybackConnections.begin();
 		auto name = GetDeviceDisplayName(connIt->first, connIt->second.first.Name());
 		const size_t numDevices = g_audioPlaybackConnections.size();
 		if (numDevices == 1)
-			swprintf_s(g_nid.szTip, L"BTAudio - %s", name.c_str());
+			StringCchPrintfW(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"BTAudio - %s", name.c_str());
 		else
-			swprintf_s(g_nid.szTip, L"BTAudio - %s +%zu", name.c_str(), numDevices - 1);
+			StringCchPrintfW(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"BTAudio - %s +%zu", name.c_str(), numDevices - 1);
 	}
 	else if (isConnecting)
 	{
 		auto connIt = g_connectingDevices.begin();
-		auto name = GetDeviceDisplayName(connIt->first, connIt->second);
-		swprintf_s(g_nid.szTip, L"BTAudio - %s", name.c_str());
+		auto name = GetDeviceDisplayName(connIt->first, connIt->second.name);
+		StringCchPrintfW(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"BTAudio - %s", name.c_str());
 	}
 	else
 	{
-		wcscpy_s(g_nid.szTip, L"BTAudio");
+		StringCchCopyW(g_nid.szTip, ARRAYSIZE(g_nid.szTip), L"BTAudio");
 	}
 
 	if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid))
@@ -1900,15 +2219,7 @@ void SetupMainWindow()
 			return;
 		}
 
-		HideMainWindow();
-
-		RECT iconRect = GetTrayIconRect();
-		auto dpi = GetDpiForWindow(g_hWnd);
-
-		SetWindowPos(g_hWnd, HWND_TOPMOST, iconRect.left, iconRect.top, 0, 0, SWP_HIDEWINDOW);
-		g_xamlCanvas.Width(static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi));
-		g_xamlCanvas.Height(static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi));
-
+		PrepareFlyoutAnchor(GetTrayIconRect());
 		g_xamlFlyout.ShowAt(g_xamlCanvas);
 	});
 
@@ -2027,7 +2338,7 @@ void ShowMainWindow()
 	if (y + scaledHeight > workArea.bottom)
 		y = workArea.bottom - scaledHeight;
 
-	RefreshDeviceList();
+	RefreshDeviceList(true);
 
 	g_xamlCanvas.Width(windowWidth);
 	g_xamlCanvas.Height(windowHeight);
@@ -2058,6 +2369,33 @@ void HideMainWindow()
 		g_mainWindowRoot.Width(0);
 		g_mainWindowRoot.Height(0);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Collapse the main window and park it on the tray icon so a flyout can be
+// anchored there. This is the ONE place that hides the main window for a
+// flyout: the update dialogs used to shrink the window straight to 0x0 without
+// clearing g_mainWindowVisible, so the app believed the window was still open
+// and the next tray click ran HideMainWindow() instead of reopening it.
+// ---------------------------------------------------------------------------
+void PrepareFlyoutAnchor(const RECT& iconRect)
+{
+	// Hide the main window (and reset the canvas/root) so the flyout is the
+	// only thing on screen, then park the hidden host window on the tray icon
+	// so ShowAt(canvas) opens right next to it.
+	HideMainWindow();
+
+	const int dpi = GetDpiForWindow(g_hWnd);
+	const int width = iconRect.right - iconRect.left;
+	const int height = iconRect.bottom - iconRect.top;
+
+	// Keep the host window hidden: a shown 1x1 window on top of the icon would
+	// swallow the next tray click, and a 0-alpha layered window is click-through
+	// anyway. The flyout itself is a separate popup, it does not need a visible
+	// anchor window (this mirrors the shipped exit-confirmation flyout).
+	SetWindowPos(g_hWnd, HWND_TOPMOST, iconRect.left, iconRect.top, 0, 0, SWP_HIDEWINDOW);
+	g_xamlCanvas.Width(static_cast<float>(width * USER_DEFAULT_SCREEN_DPI / dpi));
+	g_xamlCanvas.Height(static_cast<float>(height * USER_DEFAULT_SCREEN_DPI / dpi));
 }
 
 // Remove an element from a panel if present (the UIElementCollection
@@ -2093,7 +2431,8 @@ void RemoveAvailableCard(const std::wstring& id)
 
 // Build a card for the connected list. Returns refs so RefreshDeviceList can
 // update the text in place on later refreshes.
-DeviceCardRefs CreateConnectedCard(const std::wstring& id, const DeviceInformation& device)
+DeviceCardRefs CreateConnectedCard(const std::wstring& id, const DeviceInformation& device,
+	float masterVolume, int battery)
 {
 	using namespace winrt::Windows::UI;
 	using namespace winrt::Windows::UI::Xaml::Media;
@@ -2104,9 +2443,10 @@ DeviceCardRefs CreateConnectedCard(const std::wstring& id, const DeviceInformati
 	nameText.VerticalAlignment(VerticalAlignment::Center);
 	nameText.TextTrimming(TextTrimming::CharacterEllipsis);
 
-	// Build status text, appending battery level if available.
+	// Build status text, appending battery level if available. Both the battery
+	// level and the master volume are resolved once per refresh by the caller —
+	// querying them per card was a measurable COM/WinRT cost.
 	std::wstring statusStr = _(L"Connected");
-	int battery = GetDeviceBatteryLevel(id);
 	if (battery >= 0)
 		statusStr += L" | " + std::to_wstring(battery) + L"%";
 
@@ -2178,7 +2518,6 @@ DeviceCardRefs CreateConnectedCard(const std::wstring& id, const DeviceInformati
 	volumeSlider.VerticalAlignment(VerticalAlignment::Center);
 	volumeSlider.Margin({ 4, 0, 0, 0 });
 	volumeSlider.StepFrequency(1);
-	const float masterVolume = GetMasterVolume();
 	if (masterVolume < 0)
 	{
 		volumeSlider.IsEnabled(false);
@@ -2290,7 +2629,7 @@ DeviceCardRefs CreateConnectedCard(const std::wstring& id, const DeviceInformati
 	deviceCard.BorderThickness(Thickness(1));
 	deviceCard.BorderBrush(SolidColorBrush(Colors::LightGray()));
 
-	return DeviceCardRefs{ deviceCard, nameText, statusText, volumeSlider };
+	return DeviceCardRefs{ deviceCard, nameText, statusText, volumeSlider, false };
 }
 
 // Build a card for the available/connecting list. connecting=true renders the
@@ -2426,13 +2765,58 @@ DeviceCardRefs CreateAvailableCard(const std::wstring& id, const DeviceInformati
 	availCard.BorderThickness(Thickness(1));
 	availCard.BorderBrush(SolidColorBrush(Colors::LightGray()));
 
-	return DeviceCardRefs{ availCard, nameText, connecting ? statusText : TextBlock{ nullptr }, Slider{ nullptr } };
+	return DeviceCardRefs{ availCard, nameText, connecting ? statusText : TextBlock{ nullptr }, Slider{ nullptr },
+		connecting && isAutoReconnect };
 }
 
-void RefreshDeviceList()
+void RefreshDeviceList(bool force)
 {
 	using namespace winrt::Windows::UI;
 	using namespace winrt::Windows::UI::Xaml::Media;
+
+	// Battery levels are queried ONCE per device here and reused for both the
+	// card text and the one-shot low-battery balloon. This has to run even while
+	// the window is hidden — the tray-only mode is the normal mode of operation,
+	// so gating it behind the XAML rebuild would silently disable the warning.
+	std::unordered_map<std::wstring, int> batteryLevels;
+	batteryLevels.reserve(g_audioPlaybackConnections.size());
+	for (const auto& [id, pair] : g_audioPlaybackConnections)
+	{
+		const int battery = GetDeviceBatteryLevel(id);
+		batteryLevels.emplace(id, battery);
+		if (battery < 0)
+			continue;
+
+		// Low-battery notification (one-shot per discharge cycle: reset when
+		// the level climbs back above the threshold).
+		if (battery <= LOW_BATTERY_THRESHOLD &&
+			g_lowBatteryNotified.find(id) == g_lowBatteryNotified.end())
+		{
+			g_lowBatteryNotified.insert(id);
+			std::wstring text = GetDeviceDisplayName(id, pair.first.Name()) +
+				L" — " + _(L"Battery is low");
+			// Safe to call directly: this runs on the UI thread.
+			ShowTrayNotification(L"BTAudio", text.c_str());
+		}
+		else if (battery > LOW_BATTERY_THRESHOLD)
+		{
+			g_lowBatteryNotified.erase(id);
+		}
+	}
+
+	// While the main window is hidden there is nothing to render: skip the
+	// whole XAML rebuild (device events can be frequent) and only keep the tray
+	// icon in sync. ShowMainWindow() calls this with force=true, which
+	// reconciles the (possibly stale) cards in one pass.
+	if (!force && !g_mainWindowVisible)
+	{
+		UpdateNotifyIcon();
+		return;
+	}
+
+	// Resolved once per refresh, not per device: endpoint activation is a COM
+	// round-trip on the UI thread.
+	const float masterVolume = GetMasterVolume();
 
 	// ---- Connected devices (incremental) ----
 	if (g_mainDeviceListPanel)
@@ -2453,25 +2837,29 @@ void RefreshDeviceList()
 		for (const auto& [id, pair] : g_audioPlaybackConnections)
 		{
 			const auto& device = pair.first;
+			const auto batteryIt = batteryLevels.find(id);
+			const int battery = batteryIt != batteryLevels.end() ? batteryIt->second : -1;
 			auto it = g_connectedCards.find(id);
 			if (it != g_connectedCards.end())
 			{
 				// Card exists — update name/status in place.
 				it->second.name.Text(GetDeviceDisplayName(id, device.Name()));
 				std::wstring statusStr = _(L"Connected");
-				int battery = GetDeviceBatteryLevel(id);
 				if (battery >= 0)
 					statusStr += L" | " + std::to_wstring(battery) + L"%";
 				it->second.status.Text(statusStr);
 				// Keep the volume slider in sync with the system volume
-				// (changed externally via volume keys / mixer).
+				// (changed externally via volume keys / mixer). Re-evaluate the
+				// enabled state too: a render endpoint may have appeared after
+				// the card was built (headphones plugged in, profile switch) and
+				// an in-place update never used to re-enable the slider.
 				if (it->second.volume)
 				{
-					const float vol = GetMasterVolume();
-					if (vol >= 0)
+					it->second.volume.IsEnabled(masterVolume >= 0);
+					if (masterVolume >= 0)
 					{
 						VolumeUpdateGuard guard(g_updatingVolume);
-						it->second.volume.Value(vol * 100.0);
+						it->second.volume.Value(masterVolume * 100.0);
 					}
 				}
 			}
@@ -2480,29 +2868,9 @@ void RefreshDeviceList()
 				// A stale card for this id may still live in the available
 				// panel (device just connected) — remove it there first.
 				RemoveAvailableCard(id);
-				auto refs = CreateConnectedCard(id, device);
+				auto refs = CreateConnectedCard(id, device, masterVolume, battery);
 				g_mainDeviceListPanel.Children().Append(refs.card);
 				g_connectedCards.emplace(id, std::move(refs));
-			}
-
-			// Low-battery notification (one-shot per discharge cycle: reset
-			// when the level climbs back above the threshold).
-			int battery = GetDeviceBatteryLevel(id);
-			if (battery >= 0)
-			{
-				if (battery <= LOW_BATTERY_THRESHOLD &&
-					g_lowBatteryNotified.find(id) == g_lowBatteryNotified.end())
-				{
-					g_lowBatteryNotified.insert(id);
-					std::wstring text = GetDeviceDisplayName(id, device.Name()) +
-						L" — " + _(L"Battery is low");
-					// Safe to call directly: this runs on the UI thread.
-					ShowTrayNotification(L"BTAudio", text.c_str());
-				}
-				else if (battery > LOW_BATTERY_THRESHOLD)
-				{
-					g_lowBatteryNotified.erase(id);
-				}
 			}
 		}
 		// Placeholder when the list is empty.
@@ -2531,8 +2899,8 @@ void RefreshDeviceList()
 				continue;
 			expected.insert(id);
 		}
-		for (const auto& [id, name] : g_connectingDevices)
-			expected.insert(id);
+		for (const auto& connecting : g_connectingDevices)
+			expected.insert(connecting.first);
 
 		// Drop cards no longer expected.
 		for (auto it = g_availableCards.begin(); it != g_availableCards.end(); )
@@ -2551,14 +2919,20 @@ void RefreshDeviceList()
 		// Add or update cards.
 		for (const auto& id : expected)
 		{
-			const bool isConnecting = g_connectingDevices.find(id) != g_connectingDevices.end();
+			auto cit = g_connectingDevices.find(id);
+			const bool isConnecting = cit != g_connectingDevices.end();
+			const bool isAutoReconnect = isConnecting && cit->second.isAutoReconnect;
 			auto it = g_availableCards.find(id);
 			if (it != g_availableCards.end())
 			{
-				// Update text in place; rebuild only if the card shape
-				// (connecting status vs. connect button) changed.
+				// Update the text in place; rebuild only when the card SHAPE
+				// changed — either connecting <-> connect button, or a manual
+				// connect turning into an auto-reconnect (which renders the
+				// Cancel button; that used to never appear because the shape
+				// check only looked at "is connecting").
 				const bool wasConnecting = static_cast<bool>(it->second.status);
-				if (isConnecting == wasConnecting)
+				if (isConnecting == wasConnecting &&
+					isAutoReconnect == it->second.isAutoReconnect)
 				{
 					DeviceInformation device{ nullptr };
 					auto dit = g_availableDevices.find(id);
@@ -2566,14 +2940,9 @@ void RefreshDeviceList()
 						device = dit->second;
 					std::wstring displayName;
 					if (isConnecting)
-					{
-						auto cit = g_connectingDevices.find(id);
-						displayName = GetDeviceDisplayName(id, cit != g_connectingDevices.end() ? cit->second : L"");
-					}
+						displayName = GetDeviceDisplayName(id, cit->second.name);
 					else
-					{
 						displayName = GetDeviceDisplayName(id, device ? device.Name() : L"");
-					}
 					it->second.name.Text(displayName);
 					if (isConnecting)
 						it->second.status.Text(_(L"Connecting"));
@@ -2589,10 +2958,8 @@ void RefreshDeviceList()
 			auto dit = g_availableDevices.find(id);
 			if (dit != g_availableDevices.end())
 				device = dit->second;
-			auto cit = g_connectingDevices.find(id);
-			if (cit != g_connectingDevices.end())
-				connectingName = cit->second;
-			const bool isAutoReconnect = g_autoReconnectingDevices.find(id) != g_autoReconnectingDevices.end();
+			if (isConnecting)
+				connectingName = cit->second.name;
 			auto refs = CreateAvailableCard(id, device, connectingName, isConnecting, isAutoReconnect);
 			g_mainAvailableListPanel.Children().Append(refs.card);
 			g_availableCards.emplace(id, std::move(refs));
@@ -2703,13 +3070,7 @@ void ShowUpdateDialog()
 	g_updateFlyout = flyout;
 
 	// Show near the tray icon (same pattern as the exit-confirmation flyout).
-	RECT iconRect = GetTrayIconRect();
-
-	auto dpi = GetDpiForWindow(g_hWnd);
-	g_xamlCanvas.Width(static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi));
-	g_xamlCanvas.Height(static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi));
-
-	SetWindowPos(g_hWnd, HWND_TOPMOST, iconRect.left, iconRect.top, 0, 0, SWP_HIDEWINDOW);
+	PrepareFlyoutAnchor(GetTrayIconRect());
 	g_updateFlyout.ShowAt(g_xamlCanvas);
 }
 
@@ -2765,12 +3126,7 @@ void ShowUpdateInstalledDialog()
 	g_updateInstalledFlyout = flyout;
 
 	// Show near the tray icon (same pattern as the update dialog).
-	RECT iconRect = GetTrayIconRect();
-	auto dpi = GetDpiForWindow(g_hWnd);
-	g_xamlCanvas.Width(static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi));
-	g_xamlCanvas.Height(static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi));
-
-	SetWindowPos(g_hWnd, HWND_TOPMOST, iconRect.left, iconRect.top, 0, 0, SWP_HIDEWINDOW);
+	PrepareFlyoutAnchor(GetTrayIconRect());
 	g_updateInstalledFlyout.ShowAt(g_xamlCanvas);
 }
 

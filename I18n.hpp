@@ -38,26 +38,68 @@ inline void LoadTranslateData()
 		break;
 	}
 
-	auto hRes = langId ? FindResourceExW(g_hInst, L"YMO", MAKEINTRESOURCEW(1), langId) : nullptr;
-	if (hRes)
-	{
-		auto hResData = LoadResource(g_hInst, hRes);
-		if (hResData)
-		{
-			auto ymo = reinterpret_cast<const YMOData*>(LockResource(hResData));
-			if (ymo)
-			{
-				hashToStrMap.reserve(ymo->len);
+	// Fallback chain: exact LANGID -> neutral sublanguage of that language ->
+	// Simplified Chinese for any other Chinese locale -> English (no resource,
+	// source strings). Before this, region-specific Chinese UI languages such
+	// as zh-HK / zh-SG / zh-MO (0x0C04 / 0x1004 / 0x1404) matched neither
+	// resource, so the entire UI silently fell back to English.
+	const WORD candidates[] = {
+		langId,
+		langId ? static_cast<WORD>(MAKELANGID(PRIMARYLANGID(langId), SUBLANG_NEUTRAL)) : static_cast<WORD>(0),
+		(langId && PRIMARYLANGID(langId) == LANG_CHINESE)
+			? static_cast<WORD>(MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED))
+			: static_cast<WORD>(0),
+	};
 
-				for (int i = 0; i < ymo->len; ++i)
-				{
-					auto hash = ymo->table[i].hash;
-					auto offset = ymo->table[i].offset;
-					auto str = reinterpret_cast<const wchar_t*>(reinterpret_cast<const uint8_t*>(hResData) + offset);
-					hashToStrMap.emplace(hash, str);
-				}
-			}
-		}
+	HRSRC hRes = nullptr;
+	for (const WORD candidate : candidates)
+	{
+		if (candidate == 0)
+			continue;
+		hRes = FindResourceExW(g_hInst, L"YMO", MAKEINTRESOURCEW(1), candidate);
+		if (hRes)
+			break;
+	}
+	if (!hRes)
+		return;
+
+	const DWORD resourceSize = SizeofResource(g_hInst, hRes);
+	if (resourceSize == 0)
+		return;
+
+	auto hResData = LoadResource(g_hInst, hRes);
+	if (!hResData)
+		return;
+
+	// Use the locked pointer for BOTH the header and the string data (the
+	// offsets are relative to the start of the resource).
+	const auto* base = reinterpret_cast<const uint8_t*>(LockResource(hResData));
+	if (!base)
+		return;
+
+	auto ymo = reinterpret_cast<const YMOData*>(base);
+	// Validate the header before walking the table: a truncated or mismatched
+	// data file must not be able to make us read past the end of the resource.
+	const size_t headerSize = offsetof(YMOData, table) +
+		static_cast<size_t>(ymo->len) * sizeof(ymo->table[0]);
+	if (ymo->len == 0 || headerSize > resourceSize)
+		return;
+
+	hashToStrMap.reserve(ymo->len);
+	for (uint16_t i = 0; i < ymo->len; ++i)
+	{
+		const uint32_t hash = ymo->table[i].hash;
+		const size_t offset = ymo->table[i].offset;
+		if (offset < headerSize || offset + sizeof(wchar_t) > resourceSize)
+			continue;
+
+		auto str = reinterpret_cast<const wchar_t*>(base + offset);
+		// The string must be NUL-terminated inside the resource.
+		const size_t maxChars = (resourceSize - offset) / sizeof(wchar_t);
+		if (wcsnlen(str, maxChars) == maxChars)
+			continue;
+
+		hashToStrMap.emplace(hash, str);
 	}
 }
 

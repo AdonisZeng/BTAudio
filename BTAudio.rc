@@ -89,9 +89,9 @@ BEGIN
             VALUE "CompanyName", "AdonisZeng"
             VALUE "FileDescription", "BTAudio"
             VALUE "FileVersion", BTAUDIO_VERSION_STR
-            VALUE "InternalName", "BTAudio.exe"
+            VALUE "InternalName", "BTAudio"
             VALUE "LegalCopyright", BTAUDIO_COPYRIGHT_STR
-            VALUE "OriginalFilename", "BTAudio.exe"
+            VALUE "OriginalFilename", "BTAudio"
             VALUE "ProductName", "BTAudio"
             VALUE "ProductVersion", BTAUDIO_VERSION_STR
         END

@@ -21,6 +21,7 @@
 #include <shellscalingapi.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
+#include <strsafe.h>
 
 // C++ RunTime Header Files
 #include <cstdlib>
@@ -29,8 +30,10 @@
 #include <map>
 #include <set>
 #include <deque>
+#include <vector>
 #include <filesystem>
 #include <mutex>
+#include <atomic>
 
 // wil
 #ifndef _DEBUG

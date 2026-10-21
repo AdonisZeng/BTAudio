@@ -74,22 +74,22 @@ constexpr int MANUAL_RETRY_COUNT = 2;
 // initialization (manual backoff curve: 1s, 2s, then 4s capped — roughly
 // 19s of backoff across 7 attempts).
 constexpr int STARTUP_RETRY_COUNT = 6;
-// Auto-reconnect (unexpected link drop): enough attempts to actually reach
-// the AUTO_RECONNECT_TIMEOUT_MS wall-clock cap. 12 attempts with the
-// 1s..30s backoff curve span several minutes; without this the chain would
-// exhaust its attempts long before the deadline and the effective
-// availability window would stay short no matter how long the deadline is.
+// Auto-reconnect (unexpected link drop): 12 retries (13 attempts in total)
+// with the 1s..30s backoff curve span roughly 4.5 minutes. The wall-clock cap
+// below is deliberately set to 5 minutes so the two limits agree — a 10-minute
+// cap was unreachable (the chain always died after ~4.5 min), which silently
+// halved the window in which a device that comes back late can reconnect.
 constexpr int AUTO_RECONNECT_RETRY_COUNT = 12;
 
 // Wall-clock timeout for an auto-reconnect cycle (unexpected link drop). Caps
 // the entire retry chain so a permanently-unreachable device doesn't keep the
-// tray icon in the amber "connecting" state indefinitely. Kept generous:
-// once this chain ends, no AudioPlaybackConnection object is held anymore,
-// the A2DP sink transport is deactivated, and the phone can no longer
-// connect to the PC at all — so this window IS the window in which a device
-// that comes back late (sleep/resume, briefly out of range) can return
-// without the user re-connecting it from the app.
-constexpr UINT AUTO_RECONNECT_TIMEOUT_MS = 600000; // 10 minutes
+// tray icon in the amber "connecting" state indefinitely. Once this chain
+// ends, no AudioPlaybackConnection object is held anymore, the A2DP sink
+// transport is deactivated, and the phone can no longer connect to the PC at
+// all — so this window IS the window in which a device that comes back late
+// (sleep/resume, briefly out of range) can return without the user
+// re-connecting it from the app.
+constexpr UINT AUTO_RECONNECT_TIMEOUT_MS = 300000; // 5 minutes
 
 // Wall-clock timeout for devices that were out-of-range at startup. After this
 // elapses, g_pendingConnectOnAppear is cleared and those devices are no longer
@@ -125,9 +125,20 @@ DeviceWatcher g_deviceWatcher = nullptr;
 // Available (pairable) bluetooth audio devices discovered by DeviceWatcher.
 // Keyed by device id so add/update/remove from the watcher is O(1).
 std::map<std::wstring, DeviceInformation> g_availableDevices;
-// Devices currently being connected. Key = device id, value = device name.
-// Used to render a "Connecting..." status in the available list.
-std::unordered_map<std::wstring, std::wstring> g_connectingDevices;
+// Devices currently being connected. Key = device id.
+//
+// Each entry belongs to exactly ONE connect attempt chain (identified by
+// chainId): a chain only ever clears or rewrites its own entry. The single
+// device-keyed marker used to be erased unconditionally by unrelated paths
+// (link-drop handling, cancel, retry timers), which let two chains run
+// concurrently against the same radio and could leave a stale entry behind.
+struct ConnectingEntry
+{
+	std::wstring name;
+	uint64_t chainId = 0;
+	bool isAutoReconnect = false;
+};
+std::unordered_map<std::wstring, ConnectingEntry> g_connectingDevices;
 // id -> (DeviceInformation, AudioPlaybackConnection)
 std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConnection>> g_audioPlaybackConnections;
 // Pending reconnect attempts scheduled via SetTimer, keyed by timer id.
@@ -141,6 +152,7 @@ struct PendingReconnect
 	bool isAutoReconnect;        // true => link-drop auto-reconnect (slower backoff, more tries)
 	bool notifyNextOnComplete;   // true => PostMessage(WM_CONNECTNEXT) when this attempt chain ends
 	ULONGLONG autoReconnectDeadline; // 0 = not an auto-reconnect (no deadline check)
+	uint64_t chainId;            // identifies the chain this attempt belongs to
 };
 std::map<UINT_PTR, PendingReconnect> g_pendingReconnects;
 // Device ids from g_lastDevices that were out-of-range when the startup
@@ -186,8 +198,14 @@ bool g_autoStart = false;
 // 2 = Traditional Chinese, 3 = English. Applied on the next start (the
 // translation table is loaded once at startup).
 int g_language = 0;
-// When enabled, wil diagnostics are appended to BTAudio.log next to the exe.
-bool g_debugLogging = false;
+// When enabled, wil diagnostics are appended to BTAudio.log in g_dataDir.
+// Atomic because the wil result callback may fire on any thread, and the
+// setting can be toggled at runtime from the settings flyout.
+std::atomic<bool> g_debugLogging{ false };
+// Directory holding BTAudio.json / BTAudio.log. Portable-first: the executable
+// directory when it is writable, otherwise %LOCALAPPDATA%\BTAudio. Resolved
+// once at startup by ResolveDataDir() before LoadSettings().
+fs::path g_dataDir;
 std::vector<std::wstring> g_lastDevices;
 // User-defined display aliases for devices (deviceId -> custom name).
 // Does NOT affect system Bluetooth pairing names — only the BTAudio UI.
@@ -219,6 +237,7 @@ struct DeviceCardRefs
 	winrt::Windows::UI::Xaml::Controls::TextBlock name;   // device name
 	winrt::Windows::UI::Xaml::Controls::TextBlock status; // status / battery (may be null)
 	winrt::Windows::UI::Xaml::Controls::Slider volume;    // volume slider (connected cards only)
+	bool isAutoReconnect = false; // available card rendered with a Cancel button
 };
 // id -> card refs for the connected list
 std::unordered_map<std::wstring, DeviceCardRefs> g_connectedCards;
@@ -299,21 +318,29 @@ struct ConnectResultInfo
     bool isAutoReconnect = false;
     bool notifyNextOnComplete = false;
     ULONGLONG autoReconnectDeadline = 0;
+    uint64_t chainId = 0;           // identity of the chain that produced this result
 };
 // Apply the outcome of a connect attempt chain to the global state. Runs on
 // the UI thread only (posted as WM_CONNECTRESULT): updates the connection
 // maps, schedules retries via SetTimer/g_pendingReconnects, persists settings,
 // refreshes the UI and surfaces notifications/dialogs.
 void HandleConnectResult(ConnectResultInfo& info);
-// UI-thread entry point that starts a connect attempt chain: marks the device
-// as "connecting" (g_connectingDevices) and launches the ConnectDevice
-// coroutine, which then only talks back via WM_CONNECTRESULT. Never call the
-// coroutine directly from a coroutine continuation. Returns false (starting
-// nothing) if a chain is already in flight for this device — callers that
-// legitimately restart a chain (ReconnectTimerProc) erase the "connecting"
-// entry first.
-bool StartConnect(const std::wstring& deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
-bool StartConnect(const DeviceInformation& device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0);
+// UI-thread entry point that starts (or continues) a connect attempt chain:
+// marks the device as "connecting" in g_connectingDevices and launches the
+// ConnectDevice coroutine, which then only talks back via WM_CONNECTRESULT.
+// Never call the coroutine directly from a coroutine continuation.
+//
+// chainId == 0 starts a NEW chain; a non-zero chainId continues an existing
+// chain (retry timer) and is only accepted while the entry still belongs to
+// that chain. Returns false when another chain owns the device, or when a
+// continuation arrives after the chain was cancelled.
+bool StartConnect(const std::wstring& deviceId, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0, uint64_t chainId = 0);
+bool StartConnect(const DeviceInformation& device, int retryCount = MANUAL_RETRY_COUNT, int attempt = 0, bool isAutoReconnect = false, bool notifyNextOnComplete = false, ULONGLONG autoReconnectDeadline = 0, uint64_t chainId = 0);
+// Allocate a fresh chain id (UI thread only).
+uint64_t AllocateChainId();
+// Finish the serial (startup) connect currently in flight and pump the next
+// queued device. Idempotent: does nothing when no chain is in flight.
+void EndSerialConnectChain();
 
 #include "Util.hpp"
 #include "I18n.hpp"

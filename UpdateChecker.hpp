@@ -79,8 +79,16 @@ inline std::wstring GetCurrentArch()
 // Match a lowercased asset name against the build-suffix arch. Order matters:
 // "arm64" is a substring of "arm64" itself and must be tested before "arm",
 // and "64" must NOT match an "arm64" asset.
-inline bool ArchMatchesAsset(const std::wstring& lowerName, const std::wstring& arch)
+//
+// NOTE: GetCurrentArch() returns the MSBuild $(PlatformArchitecture) suffix in
+// upper case ("ARM64"/"ARM"), so `arch` is normalised to lower case here. An
+// un-normalised value silently fell through to the "first .exe in the release"
+// fallback and could hand an ARM64 user the x64 build.
+inline bool ArchMatchesAsset(const std::wstring& lowerName, std::wstring arch)
 {
+	std::transform(arch.begin(), arch.end(), arch.begin(),
+		[](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+
 	if (arch == L"64")
 		return lowerName.find(L"arm64") == std::wstring::npos &&
 			lowerName.find(L"arm") == std::wstring::npos &&
@@ -94,6 +102,24 @@ inline bool ArchMatchesAsset(const std::wstring& lowerName, const std::wstring& 
 		return lowerName.find(L"arm") != std::wstring::npos &&
 			lowerName.find(L"arm64") == std::wstring::npos;
 	return false;
+}
+
+// A release asset is a usable update payload only when it is an .exe. Without
+// this check the architecture pass could select e.g. "BTAudio64.pdb" (or a
+// "BTAudio64.zip"), which was then moved over the running executable.
+inline bool IsExeAssetName(const std::wstring& lowerName)
+{
+	constexpr wchar_t ext[] = L".exe";
+	constexpr size_t extLen = sizeof(ext) / sizeof(ext[0]) - 1;
+	return lowerName.size() > extLen &&
+		lowerName.compare(lowerName.size() - extLen, extLen, ext) == 0;
+}
+
+inline std::wstring ToLowerWideCopy(std::wstring s)
+{
+	std::transform(s.begin(), s.end(), s.begin(),
+		[](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+	return s;
 }
 
 // Verify a downloaded buffer against the release asset digest
@@ -119,48 +145,75 @@ inline bool VerifyDownloadDigest(const std::wstring& digest, const winrt::Window
 	return _wcsicmp(actual.c_str(), expected.c_str()) == 0;
 }
 
-// Pick the asset that matches the current architecture; fall back to first .exe.
+// Pick the asset that matches the current architecture; fall back to an .exe
+// that at least carries our product name, then to the first .exe in the list.
+// Non-executable assets (.pdb, .zip, checksums, ...) are never eligible: they
+// used to be selected by the architecture pass and then moved over the exe.
 inline bool SelectAsset(const JsonArray& assets, std::wstring& outUrl, std::wstring& outName, uint64_t& outSize, std::wstring& outDigest)
 {
-	auto arch = GetCurrentArch();
-
-	if (!arch.empty())
+	struct AssetCandidate
 	{
-		for (const auto& a : assets)
-		{
-			auto obj = a.GetObject();
-			auto name = std::wstring(obj.GetNamedString(L"name"));
-			std::wstring lowerName(name);
-			std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
-				[](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
-			if (ArchMatchesAsset(lowerName, arch))
-			{
-				outUrl = std::wstring(obj.GetNamedString(L"browser_download_url"));
-				outName = name;
-				outSize = static_cast<uint64_t>(obj.GetNamedNumber(L"size"));
-				outDigest = std::wstring(obj.GetNamedString(L"digest", L""));
-				return true;
-			}		}
-	}
+		std::wstring name;      // original (diagnostics / log only)
+		std::wstring lowerName; // lower-cased copy for matching
+		std::wstring url;
+		std::wstring digest;
+		uint64_t size = 0;
+	};
+
+	std::vector<AssetCandidate> exeAssets;
+	exeAssets.reserve(assets.Size());
 
 	for (const auto& a : assets)
 	{
 		auto obj = a.GetObject();
-		auto name = std::wstring(obj.GetNamedString(L"name"));
-		if (name.size() >= 4)
+		AssetCandidate candidate;
+		candidate.name = std::wstring(obj.GetNamedString(L"name"));
+		candidate.lowerName = ToLowerWideCopy(candidate.name);
+		if (!IsExeAssetName(candidate.lowerName))
+			continue;
+		candidate.url = std::wstring(obj.GetNamedString(L"browser_download_url"));
+		candidate.size = static_cast<uint64_t>(obj.GetNamedNumber(L"size"));
+		candidate.digest = std::wstring(obj.GetNamedString(L"digest", L""));
+		exeAssets.push_back(std::move(candidate));
+	}
+
+	auto select = [&](const AssetCandidate& candidate) {
+		outUrl = candidate.url;
+		outName = candidate.name;
+		outSize = candidate.size;
+		outDigest = candidate.digest;
+	};
+
+	// 1) Exact architecture match (e.g. BTAudio64.exe on x64).
+	const auto arch = GetCurrentArch();
+	if (!arch.empty())
+	{
+		for (const auto& candidate : exeAssets)
 		{
-			auto ext = name.substr(name.size() - 4);
-			auto toLower = [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); };
-			std::transform(ext.begin(), ext.end(), ext.begin(), toLower);
-			if (ext == L".exe")
+			if (ArchMatchesAsset(candidate.lowerName, arch))
 			{
-				outUrl = std::wstring(obj.GetNamedString(L"browser_download_url"));
-				outName = name;
-				outSize = static_cast<uint64_t>(obj.GetNamedNumber(L"size"));
-				outDigest = std::wstring(obj.GetNamedString(L"digest", L""));
+				select(candidate);
 				return true;
 			}
 		}
+	}
+
+	// 2) Fallback: prefer an asset named after the product so a helper exe
+	//    shipped in the same release is not mistaken for the application.
+	for (const auto& candidate : exeAssets)
+	{
+		if (candidate.lowerName.find(L"btaudio") != std::wstring::npos)
+		{
+			select(candidate);
+			return true;
+		}
+	}
+
+	// 3) Last resort: the first executable asset.
+	if (!exeAssets.empty())
+	{
+		select(exeAssets.front());
+		return true;
 	}
 
 	return false;
@@ -236,12 +289,86 @@ inline winrt::fire_and_forget CheckForUpdate(bool silent)
 }
 
 // ---------------------------------------------------------------------------
+// Resolve an 8.3 short path when available. GetShortPathNameW reports the
+// required buffer size (including the terminator) when the caller's buffer is
+// too small, so the returned length must be validated before it is used as a
+// character count — trusting it read past the buffer for long paths.
+// ---------------------------------------------------------------------------
+inline std::wstring TryGetShortPath(const std::wstring& path)
+{
+	std::wstring buffer(MAX_PATH, L'\0');
+	DWORD length = GetShortPathNameW(path.c_str(), buffer.data(),
+		static_cast<DWORD>(buffer.size()));
+	if (length == 0)
+		return path;
+
+	if (length >= buffer.size())
+	{
+		buffer.resize(static_cast<size_t>(length) + 1);
+		length = GetShortPathNameW(path.c_str(), buffer.data(),
+			static_cast<DWORD>(buffer.size()));
+		if (length == 0 || length >= buffer.size())
+			return path;
+	}
+
+	buffer.resize(length);
+	return buffer;
+}
+
+// Escape a path for use INSIDE double quotes in a batch file. cmd.exe does not
+// treat '^' as an escape character there, so escaping '&'/'^' corrupted paths
+// containing them; only '%' still expands inside quotes and must be doubled.
+inline std::wstring EscapeQuotedBatchPath(std::wstring path)
+{
+	std::wstring out;
+	out.reserve(path.size() + 8);
+	for (wchar_t c : path)
+	{
+		if (c == L'%')
+			out += L'%';
+		out += c;
+	}
+	return out;
+}
+
+// The helper batch writes this marker when it could not replace the executable
+// even after its retries. The next start consumes it and tells the user —
+// otherwise a failed update silently keeps running the old version.
+inline fs::path GetUpdateFailedMarkerPath()
+{
+	return fs::temp_directory_path() / L"BTAudio_update_failed.txt";
+}
+
+// Returns true exactly once for a failed update (the marker is deleted).
+inline bool ConsumeFailedUpdateMarker()
+{
+	try
+	{
+		const auto marker = GetUpdateFailedMarkerPath();
+		std::error_code ec;
+		if (!fs::exists(marker, ec))
+			return false;
+		fs::remove(marker, ec);
+		return true;
+	}
+	catch (...)
+	{
+		LOG_CAUGHT_EXCEPTION();
+		return false;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Download the new exe and launch a helper batch to replace & restart.
 // ---------------------------------------------------------------------------
 inline winrt::fire_and_forget DownloadAndInstall(ReleaseInfo info)
 {
 	using namespace winrt::Windows::Web::Http;
 	using namespace winrt::Windows::Web::Http::Headers;
+
+	// Declared outside the try so the failure paths below can delete a
+	// half-downloaded file even when an exception unwinds past the write.
+	fs::path downloadPath;
 
 	try
 	{
@@ -258,18 +385,32 @@ inline winrt::fire_and_forget DownloadAndInstall(ReleaseInfo info)
 
 		auto buffer = co_await response.Content().ReadAsBufferAsync();
 
-		// Save to temp directory
-		auto tempDir = fs::temp_directory_path();
-		auto downloadPath = tempDir / info.assetName;
+		// Everything below derives from remote release metadata, so validate it
+		// before touching disk: a truncated/oversized body is not an update.
+		if (info.assetSize != 0 && buffer.Length() != info.assetSize)
+		{
+			LOG_HR_MSG(E_UNEXPECTED, "Update asset size mismatch (expected %llu, got %u)",
+				static_cast<unsigned long long>(info.assetSize), buffer.Length());
+			PostMessageW(g_hWnd, WM_UPDATEFAILED, 0, 0);
+			co_return;
+		}
 
 		// Verify the download against the published asset digest (if any).
 		// A mismatch means a corrupt or tampered file — discard it.
 		if (!VerifyDownloadDigest(info.digest, buffer))
 		{
-			DeleteFileW(downloadPath.c_str());
+			LOG_HR_MSG(E_UNEXPECTED, "Update asset digest mismatch");
 			PostMessageW(g_hWnd, WM_UPDATEFAILED, 0, 0);
 			co_return;
 		}
+
+		// Never let the remote asset name participate in path construction: a
+		// crafted name ("..\\..\\foo" or an absolute path) could write outside
+		// the temp directory. Use a fixed per-process name instead; assetName is
+		// only used for diagnostics.
+		auto tempDir = fs::temp_directory_path();
+		downloadPath = tempDir / (L"BTAudio_update_" +
+			std::to_wstring(GetCurrentProcessId()) + L".exe");
 
 		{
 			wil::unique_hfile hFile(CreateFileW(downloadPath.c_str(), GENERIC_WRITE, 0,
@@ -288,35 +429,16 @@ inline winrt::fire_and_forget DownloadAndInstall(ReleaseInfo info)
 		// Prefer short paths (ASCII-safe) to avoid spaces / unicode issues
 		// inside the batch. If 8.3 short names are disabled (GetShortPathNameW
 		// fails), fall back to the long path: the batch switches to UTF-8 via
-		// `chcp 65001` and '&' is escaped so quoted long paths survive.
-		std::wstring shortDownload = downloadPath.wstring();
-		std::wstring shortExe = exePath.wstring();
-		std::wstring shortBuf(MAX_PATH, L'\0');
-		if (DWORD n = GetShortPathNameW(shortDownload.c_str(), shortBuf.data(),
-			static_cast<DWORD>(shortBuf.size())))
-			shortDownload.assign(shortBuf.data(), n);
-		if (DWORD n = GetShortPathNameW(shortExe.c_str(), shortBuf.data(),
-			static_cast<DWORD>(shortBuf.size())))
-			shortExe.assign(shortBuf.data(), n);
-
-		// Escape '&' and '^' (cmd.exe metacharacters) inside the batch file.
-		auto escapeBatch = [](std::wstring s) {
-			std::wstring out;
-			out.reserve(s.size());
-			for (wchar_t c : s)
-			{
-				if (c == L'&' || c == L'^')
-					out += L'^';
-				out += c;
-			}
-			return out;
-		};
-		shortDownload = escapeBatch(shortDownload);
-		shortExe = escapeBatch(shortExe);
+		// `chcp 65001`.
+		std::wstring shortDownload = EscapeQuotedBatchPath(TryGetShortPath(downloadPath.wstring()));
+		std::wstring shortExe = EscapeQuotedBatchPath(TryGetShortPath(exePath.wstring()));
 
 		// Narrow to UTF-8 — the batch runs `chcp 65001` before using these.
 		std::string sDownload = Utf16ToUtf8(shortDownload);
 		std::string sExe = Utf16ToUtf8(shortExe);
+
+		std::string sFailedMarker = Utf16ToUtf8(
+			EscapeQuotedBatchPath(TryGetShortPath(GetUpdateFailedMarkerPath().wstring())));
 
 		auto batPath = tempDir / L"BTAudio_update.bat";
 		std::ostringstream bat;
@@ -330,8 +452,24 @@ inline winrt::fire_and_forget DownloadAndInstall(ReleaseInfo info)
 		bat << "  timeout /t 1 /nobreak >NUL\r\n";
 		bat << "  goto wait\r\n";
 		bat << ")\r\n";
-		bat << "move /y \"" << sDownload << "\" \"" << sExe << "\"\r\n";
+		// The old exe may still be held by AV / a scanner for a moment after
+		// the process exits, so retry the replacement instead of silently
+		// leaving the update unapplied (and never start the new exe unless the
+		// move actually succeeded).
+		bat << "set /a tries=0\r\n";
+		bat << ":replace\r\n";
+		bat << "move /y \"" << sDownload << "\" \"" << sExe << "\" >NUL 2>&1\r\n";
+		bat << "if not errorlevel 1 goto replaced\r\n";
+		bat << "set /a tries+=1\r\n";
+		bat << "if %tries% GEQ 10 goto failed\r\n";
+		bat << "timeout /t 1 /nobreak >NUL\r\n";
+		bat << "goto replace\r\n";
+		bat << ":replaced\r\n";
 		bat << "start \"\" \"" << sExe << "\"\r\n";
+		bat << "goto done\r\n";
+		bat << ":failed\r\n";
+		bat << "echo update failed> \"" << sFailedMarker << "\"\r\n";
+		bat << ":done\r\n";
 		bat << "del \"%~f0\"\r\n";
 
 		{
@@ -344,30 +482,63 @@ inline winrt::fire_and_forget DownloadAndInstall(ReleaseInfo info)
 				static_cast<DWORD>(batStr.size()), &written, nullptr));
 		}
 
-		// Launch the batch (hidden) and tell the main window to quit.
-		STARTUPINFOW si = { sizeof(si) };
-		si.dwFlags = STARTF_USESHOWWINDOW;
-		si.wShowWindow = SW_HIDE;
-		PROCESS_INFORMATION pi = {};
-		std::wstring cmd = L"/c \"" + batPath.wstring() + L"\"";
-		if (CreateProcessW(L"C:\\Windows\\System32\\cmd.exe", cmd.data(),
-			nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+		// Resolve the command interpreter through %ComSpec% instead of
+		// hard-coding C:\Windows\System32\cmd.exe: Windows may be installed on
+		// another drive, and a 32-bit image would be redirected anyway.
+		std::wstring comSpec;
 		{
-			CloseHandle(pi.hProcess);
-			CloseHandle(pi.hThread);
-			// The batch is now waiting for this process to exit. Ask the user
-			// whether to restart immediately or defer to the next exit.
-			PostMessageW(g_hWnd, WM_UPDATEINSTALLED, 0, 0);
+			wchar_t comSpecBuffer[MAX_PATH];
+			DWORD comSpecLength = GetEnvironmentVariableW(L"ComSpec", comSpecBuffer, ARRAYSIZE(comSpecBuffer));
+			if (comSpecLength > 0 && comSpecLength < ARRAYSIZE(comSpecBuffer))
+				comSpec.assign(comSpecBuffer, comSpecLength);
 		}
-	}
-	catch (winrt::hresult_error const&)
-	{
-		LOG_CAUGHT_EXCEPTION();
+		if (comSpec.empty())
+		{
+			wchar_t systemDir[MAX_PATH];
+			UINT length = GetSystemDirectoryW(systemDir, ARRAYSIZE(systemDir));
+			if (length > 0 && length < ARRAYSIZE(systemDir))
+			{
+				comSpec.assign(systemDir, length);
+				comSpec += L"\\cmd.exe";
+			}
+		}
+
+		if (!comSpec.empty())
+		{
+			// Launch the batch (hidden) and tell the main window it is waiting.
+			STARTUPINFOW si = { sizeof(si) };
+			si.dwFlags = STARTF_USESHOWWINDOW;
+			si.wShowWindow = SW_HIDE;
+			PROCESS_INFORMATION pi = {};
+			std::wstring cmd = L"/c \"" + batPath.wstring() + L"\"";
+			if (CreateProcessW(comSpec.c_str(), cmd.data(),
+				nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+			{
+				CloseHandle(pi.hProcess);
+				CloseHandle(pi.hThread);
+				// The batch is now waiting for this process to exit. Ask the
+				// user whether to restart immediately or defer to next exit.
+				PostMessageW(g_hWnd, WM_UPDATEINSTALLED, 0, 0);
+				co_return;
+			}
+			LOG_LAST_ERROR();
+		}
+		else
+		{
+			LOG_HR_MSG(E_UNEXPECTED, "Failed to locate the command interpreter");
+		}
+
+		// No usable command interpreter / process creation failed — report it
+		// to the user instead of silently doing nothing.
+		DeleteFileW(downloadPath.c_str());
+		downloadPath.clear();
 		PostMessageW(g_hWnd, WM_UPDATEFAILED, 0, 0);
 	}
 	catch (...)
 	{
 		LOG_CAUGHT_EXCEPTION();
+		if (!downloadPath.empty())
+			DeleteFileW(downloadPath.c_str());
 		PostMessageW(g_hWnd, WM_UPDATEFAILED, 0, 0);
 	}
 }

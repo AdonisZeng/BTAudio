@@ -3,6 +3,7 @@
 #include "resource.h"
 
 using namespace winrt::Windows::Data::Json;
+using namespace winrt::Windows::Devices::Bluetooth;
 using namespace winrt::Windows::Devices::Enumeration;
 using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::Media::Audio;
@@ -107,6 +108,14 @@ constexpr UINT_PTR IDT_PENDING_APPEAR_TIMEOUT = 1002;
 constexpr UINT_PTR IDT_WATCHER_POLL = 1004;
 constexpr UINT WATCHER_POLL_INTERVAL_MS = 30000; // 30 seconds
 
+// Periodic Bluetooth link check for devices believed to be connected. The
+// AudioPlaybackConnection.StateChanged event only reports A2DP-level closes;
+// when the remote turns its Bluetooth radio off, Windows drops the ACL link
+// but the sink connection can stay "Opened", leaving the UI stuck on
+// "Connected". See LinkWatchdogTimerProc.
+constexpr UINT_PTR IDT_LINK_WATCHDOG = 1005;
+constexpr UINT LINK_WATCHDOG_INTERVAL_MS = 3000;
+
 // Battery level (percent) at or below which the user gets a tray notification.
 constexpr int LOW_BATTERY_THRESHOLD = 20;
 
@@ -141,6 +150,23 @@ struct ConnectingEntry
 std::unordered_map<std::wstring, ConnectingEntry> g_connectingDevices;
 // id -> (DeviceInformation, AudioPlaybackConnection)
 std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConnection>> g_audioPlaybackConnections;
+// Per-device link-watchdog state for the entries in g_audioPlaybackConnections.
+// The BluetoothDevice is resolved once when the connection is established; its
+// ConnectionStatus reflects the classic ACL link, which goes down when the
+// remote turns Bluetooth off even if AudioPlaybackConnection stays Opened.
+// device may be null when the address could not be resolved (the watchdog then
+// falls back to polling AudioPlaybackConnection.State()).
+struct BluetoothLinkWatch
+{
+    BluetoothDevice device{ nullptr };
+    // Only start counting Disconnected samples after the link has been seen
+    // Connected at least once. Guards against killing a healthy A2DP session
+    // when the resolved BluetoothDevice is not the peer we think it is (bad
+    // address) or when the peer never establishes a classic ACL link.
+    bool linkSeenConnected = false;
+    int disconnectedSamples = 0; // consecutive Disconnected reads (debounce)
+};
+std::unordered_map<std::wstring, BluetoothLinkWatch> g_bluetoothLinkWatch;
 // Pending reconnect attempts scheduled via SetTimer, keyed by timer id.
 // The timer callback fires inside the message loop, so all map accesses stay
 // on the UI thread (same thread that owns the connection maps above).
@@ -270,6 +296,11 @@ std::wstring GetDeviceDisplayName(const std::wstring& deviceId, std::wstring_vie
 int GetDeviceBatteryLevel(const std::wstring& deviceId);
 VOID CALLBACK StartupDelayTimerProc(HWND, UINT, UINT_PTR, DWORD);
 VOID CALLBACK PendingAppearTimeoutTimerProc(HWND, UINT, UINT_PTR, DWORD);
+// Polls AudioPlaybackConnection.State() and, when available, the classic
+// Bluetooth link status of every device in g_audioPlaybackConnections and
+// routes an unexpected drop through HandleDeviceClosed (the same path as
+// StateChanged). Runs on the UI thread.
+VOID CALLBACK LinkWatchdogTimerProc(HWND, UINT, UINT_PTR, DWORD);
 // Cancel an in-progress auto-reconnect for a device: kills pending retry
 // timers, clears the connecting/auto-reconnect tracking, and refreshes the UI.
 void CancelReconnect(const std::wstring& deviceId);
@@ -311,6 +342,10 @@ struct ConnectResultInfo
     std::wstring errorMessage;      // localized failure reason; empty = stay silent
     DeviceInformation device = nullptr;       // set on success (owned by the UI thread)
     winrt::Windows::Media::Audio::AudioPlaybackConnection connection = nullptr; // set on success
+    // Classic Bluetooth device resolved from the remote address on success.
+    // Used by the link watchdog only; null when the address could not be
+    // resolved (the watchdog then polls State() alone).
+    winrt::Windows::Devices::Bluetooth::BluetoothDevice bluetoothDevice = nullptr;
     bool success = false;
     bool shouldRetry = false;       // transient failure (timeout / unknown)
     int retryCount = 0;             // remaining retries after this attempt

@@ -194,6 +194,75 @@ int GetDeviceBatteryLevel(const std::wstring& deviceId)
 }
 
 // ---------------------------------------------------------------------------
+// Resolve the remote classic Bluetooth address of an A2DP sink device.
+//
+// The link watchdog needs a BluetoothDevice for the paired remote so it can
+// read ConnectionStatus. The address is normally available as the
+// System.DeviceInterface.Bluetooth.DeviceAddress property (a string such as
+// "1C112F7687BE"); both the watcher and the CreateFromIdAsync overload used by
+// reconnects request it. The BTHENUM instance id is parsed as a fallback
+// (`...&1&1C112F7687BE_C00000000`) for ids that predate that request.
+// Returns 0 when no address can be determined (watchdog degrades to State()).
+// ---------------------------------------------------------------------------
+static uint64_t GetDeviceBluetoothAddress(const DeviceInformation& device)
+{
+	auto isHexDigit = [](wchar_t c) {
+		return (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F');
+	};
+
+	try
+	{
+		auto value = device.Properties().Lookup(L"System.DeviceInterface.Bluetooth.DeviceAddress");
+		auto prop = value.try_as<IPropertyValue>();
+		if (prop)
+		{
+			if (prop.Type() == PropertyType::UInt64)
+				return prop.GetUInt64();
+			if (prop.Type() == PropertyType::String)
+			{
+				const std::wstring raw(prop.GetString().c_str());
+				std::wstring digits;
+				digits.reserve(raw.size());
+				for (wchar_t c : raw)
+				{
+					if (isHexDigit(c))
+						digits.push_back(c);
+				}
+				if (digits.size() == 12)
+					return std::stoull(digits, nullptr, 16);
+			}
+		}
+	}
+	catch (...)
+	{
+		// Property absent (CreateFromIdAsync) or the property store failed —
+		// fall through to the id parse below.
+	}
+
+	try
+	{
+		const std::wstring id(device.Id());
+		constexpr std::wstring_view marker = L"_C00000000";
+		const size_t pos = id.find(marker);
+		// The address must be the 12 hex digits immediately before the marker,
+		// preceded by a separator. Without the boundary check a future id format
+		// change could silently pick up an unrelated 12-character fragment.
+		if (pos != std::wstring::npos && pos >= 13 &&
+			(id[pos - 13] == L'&' || id[pos - 13] == L'_'))
+		{
+			const std::wstring digits = id.substr(pos - 12, 12);
+			if (std::all_of(digits.begin(), digits.end(), isHexDigit))
+				return std::stoull(digits, nullptr, 16);
+		}
+	}
+	catch (...)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Master volume helpers — control the default render endpoint (the device
 // BTAudio's audio actually plays through) via IAudioEndpointVolume. Returns
 // nullptr/-1 when no render endpoint exists.
@@ -525,6 +594,7 @@ LRESULT CALLBACK HandleMessage(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
 		if (g_reconnect)
 			SaveSettings();
 		g_audioPlaybackConnections.clear();
+		g_bluetoothLinkWatch.clear();
 		if (!g_reconnect)
 			SaveSettings();
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -711,6 +781,9 @@ LRESULT CALLBACK HandleMessage(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
 		// in-flight attempt is cleaned up through the cancellation check in
 		// HandleConnectResult when its result arrives.
 		CancelReconnect(*pId);
+		// The interface is gone; a cached BluetoothDevice for this id would
+		// otherwise stay alive until the process exits.
+		g_bluetoothLinkWatch.erase(*pId);
 	}
 	break;
 	case WM_REFRESHDEVICELIST:
@@ -1323,6 +1396,33 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int retryCount, i
 				}
 				break;
 			}
+
+			if (info.success)
+			{
+				// Resolve the paired classic Bluetooth device for the link
+				// watchdog. AudioPlaybackConnection has no link-status API, and
+				// on Windows its State can stay Opened after the remote radio
+				// goes off; ConnectionStatus of the BluetoothDevice is the
+				// authoritative ACL-link signal. This is best effort: without it
+				// the watchdog still polls State().
+				try
+				{
+					const uint64_t address = GetDeviceBluetoothAddress(device);
+					if (address != 0)
+					{
+						auto resolved = co_await BluetoothDevice::FromBluetoothAddressAsync(address);
+						// Consistency check: a wrong address must not feed a bogus
+						// BluetoothDevice to the watchdog (its ConnectionStatus
+						// would then permanently read Disconnected).
+						if (resolved && resolved.BluetoothAddress() == address)
+							info.bluetoothDevice = resolved;
+					}
+				}
+				catch (...)
+				{
+					LOG_CAUGHT_EXCEPTION();
+				}
+			}
 		}
 		else
 		{
@@ -1366,7 +1466,13 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId, int retryCount, int 
 	// valid across the suspension point below.
 	try
 	{
-		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+		// Request the address property here as well: this overload is used by
+		// startup and automatic reconnects, whose DeviceInformation would
+		// otherwise carry only the default properties.
+		auto additionalProperties = winrt::single_threaded_vector<winrt::hstring>({
+			L"System.DeviceInterface.Bluetooth.DeviceAddress"
+		});
+		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId, additionalProperties);
 		ConnectDevice(device, retryCount, attempt, isAutoReconnect, notifyNextOnComplete, autoReconnectDeadline, chainId);
 	}
 	catch (winrt::hresult_error const& ex)
@@ -1459,6 +1565,16 @@ void HandleConnectResult(ConnectResultInfo& info)
 			oldConnection.Close();
 		}
 		g_audioPlaybackConnections.emplace(info.deviceId, std::pair(info.device, info.connection));
+
+		// Arm the link watchdog for this device. It polls State() plus (when
+		// the remote address could be resolved) the classic Bluetooth
+		// ConnectionStatus, so the UI notices a remote radio being switched
+		// off even when no StateChanged(Closed) event ever arrives.
+		if (info.bluetoothDevice)
+			g_bluetoothLinkWatch[info.deviceId] = BluetoothLinkWatch{ info.bluetoothDevice, false, 0 };
+		else
+			g_bluetoothLinkWatch.erase(info.deviceId);
+		SetTimer(g_hWnd, IDT_LINK_WATCHDOG, LINK_WATCHDOG_INTERVAL_MS, LinkWatchdogTimerProc);
 
 		// A new A2DP sink is up: the default render endpoint may have changed,
 		// so drop the cached IAudioEndpointVolume before touching the volume.
@@ -1608,7 +1724,8 @@ void HandleConnectResult(ConnectResultInfo& info)
 }
 
 // Process a Closed notification posted from the AudioPlaybackConnection
-// StateChanged callback. Runs on the UI thread.
+// StateChanged callback, and the link-watchdog equivalent for a remote radio
+// that went off without raising that event. Runs on the UI thread.
 //
 // Decision logic relies on map membership: every user-initiated teardown
 // (disconnect button, reconnect button, duplicate-connection replacement,
@@ -1616,6 +1733,13 @@ void HandleConnectResult(ConnectResultInfo& info)
 // BEFORE calling Close(). Therefore:
 //   * entry still present  -> unexpected link drop -> auto-reconnect.
 //   * entry already gone  -> user/system initiated -> ignore.
+//
+// Unlike those paths, this function performs the deterministic teardown
+// itself: it keeps a strong reference, erases the connection and its
+// link-watch entry, and calls Close() BEFORE starting a new connect chain.
+// The watchdog path needs this because State() can still report Opened after
+// the ACL link drops — merely releasing the last reference would defer the
+// per-device transport teardown and race the retry it is about to start.
 void HandleDeviceClosed(const std::wstring& deviceId, void* connectionAbiPtr)
 {
 	auto it = g_audioPlaybackConnections.find(deviceId);
@@ -1630,10 +1754,24 @@ void HandleDeviceClosed(const std::wstring& deviceId, void* connectionAbiPtr)
 		return;
 
 	std::wstring deviceName(GetDeviceDisplayName(deviceId, it->second.first.Name()));
-	// Erase the stale connection object first; the auto-reconnect below will
-	// create a fresh one if it succeeds. The A2DP sink endpoint is gone, so the
-	// cached IAudioEndpointVolume no longer points at the right device.
+	// Keep a strong reference while removing the bookkeeping entry: on the
+	// watchdog path State() is still Opened, and merely releasing the last
+	// reference defers the per-device transport teardown (see the failure
+	// cleanup in ConnectDevice). Close() explicitly BEFORE the auto-reconnect
+	// below starts a new chain, so the retry does not race a dying sink.
+	AudioPlaybackConnection connection = it->second.second;
 	g_audioPlaybackConnections.erase(it);
+	g_bluetoothLinkWatch.erase(deviceId);
+	try
+	{
+		connection.Close();
+	}
+	catch (...)
+	{
+		// The Bluetooth audio service may already be gone (sleep/resume); the
+		// reconnect path below must still run.
+		LOG_CAUGHT_EXCEPTION();
+	}
 	InvalidateAudioEndpointCache();
 	// Do NOT erase g_connectingDevices[deviceId] here: if a connect chain is
 	// already running for this device (manual click / startup reconnect), that
@@ -1672,6 +1810,115 @@ void HandleDeviceClosed(const std::wstring& deviceId, void* connectionAbiPtr)
 		// Defensive: do not leave a "reconnecting" marker behind without a
 		// chain to clear it.
 		g_autoReconnectingDevices.erase(deviceId);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LinkWatchdogTimerProc — periodic liveness check for devices that are still
+// in g_audioPlaybackConnections.
+//
+// Why this exists: AudioPlaybackConnection.StateChanged(Closed) is only raised
+// when the A2DP session itself closes. When the remote (phone) turns its
+// Bluetooth radio off, Windows tears down the classic ACL link but the sink
+// connection can keep reporting Opened, so the old code showed "Connected"
+// forever. This watchdog checks two independent signals:
+//   * AudioPlaybackConnection.State() — catches A2DP-level closes even if the
+//     event was missed;
+//   * BluetoothDevice.ConnectionStatus() — the ACL link, which is what actually
+//     goes down when the remote radio is switched off.
+// The ACL signal is only trusted after it has been observed Connected once:
+// that guards against a mis-resolved BluetoothDevice or a peer that never
+// established the classic link, either of which would otherwise read
+// Disconnected forever and cause a disconnect/reconnect loop. Two consecutive
+// Disconnected reads are still required to avoid dropping a connection that is
+// settling after OpenAsync. A drop is routed through HandleDeviceClosed, i.e.
+// exactly the same path StateChanged uses (deterministic Close + notification +
+// auto-reconnect). Runs on the UI thread.
+// ---------------------------------------------------------------------------
+VOID CALLBACK LinkWatchdogTimerProc(HWND hwnd, UINT, UINT_PTR idEvent, DWORD)
+{
+	if (g_audioPlaybackConnections.empty())
+	{
+		KillTimer(hwnd, idEvent);
+		g_bluetoothLinkWatch.clear();
+		return;
+	}
+
+	// Collect first: HandleDeviceClosed erases from the map and starts a
+	// reconnect chain, so it must not run while the map is being iterated.
+	std::vector<std::wstring> dropped;
+	for (const auto& [id, entry] : g_audioPlaybackConnections)
+	{
+		bool isDown = false;
+
+		try
+		{
+			if (entry.second.State() == AudioPlaybackConnectionState::Closed)
+				isDown = true;
+		}
+		catch (...)
+		{
+			// The Bluetooth audio service can be unavailable right after
+			// sleep/resume; a failed query is not evidence of a disconnect.
+			LOG_CAUGHT_EXCEPTION();
+		}
+
+		if (!isDown)
+		{
+			auto linkIt = g_bluetoothLinkWatch.find(id);
+			if (linkIt != g_bluetoothLinkWatch.end() && linkIt->second.device)
+			{
+				try
+				{
+					const auto status = linkIt->second.device.ConnectionStatus();
+					if (status == BluetoothConnectionStatus::Connected)
+					{
+						// A healthy classic link: arm the disconnect debounce only
+						// after it has actually been observed connected. A bogus
+						// BluetoothDevice (wrong address) or a peer that never
+						// established the ACL link therefore can never trigger a
+						// drop, avoiding a disconnect/reconnect loop.
+						linkIt->second.linkSeenConnected = true;
+						linkIt->second.disconnectedSamples = 0;
+					}
+					else if (status == BluetoothConnectionStatus::Disconnected &&
+						linkIt->second.linkSeenConnected)
+					{
+						++linkIt->second.disconnectedSamples;
+						if (linkIt->second.disconnectedSamples >= 2)
+							isDown = true;
+					}
+				}
+				catch (...)
+				{
+					// A failed query is not evidence of a disconnect; reset the
+					// debounce so one transient failure cannot combine with a real
+					// Disconnected sample into a false drop.
+					linkIt->second.disconnectedSamples = 0;
+					LOG_CAUGHT_EXCEPTION();
+				}
+			}
+		}
+
+		if (isDown)
+			dropped.push_back(id);
+	}
+
+	for (const auto& id : dropped)
+	{
+		auto it = g_audioPlaybackConnections.find(id);
+		if (it == g_audioPlaybackConnections.end())
+			continue; // already removed (StateChanged or user action won the race)
+		// Passing the current connection's ABI pointer satisfies the
+		// generation check inside HandleDeviceClosed, which also erases the
+		// link-watch entry and closes the connection deterministically.
+		HandleDeviceClosed(id, winrt::get_abi(it->second.second));
+	}
+
+	if (g_audioPlaybackConnections.empty())
+	{
+		KillTimer(hwnd, idEvent);
+		g_bluetoothLinkWatch.clear();
 	}
 }
 
@@ -1804,8 +2051,11 @@ bool SetupDeviceWatcher()
 
 		// Request the battery-level property so we can display it in the UI.
 		// DEVPKEY_Device_BatteryLevel = {104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2
+		// Also request the remote Bluetooth address so the link watchdog can
+		// resolve the paired BluetoothDevice (see LinkWatchdogTimerProc).
 		auto additionalProperties = winrt::single_threaded_vector<winrt::hstring>({
-			L"{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2"
+			L"{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2",
+			L"System.DeviceInterface.Bluetooth.DeviceAddress"
 		});
 		g_deviceWatcher = DeviceInformation::CreateWatcher(selector, additionalProperties);
 
@@ -2566,6 +2816,7 @@ DeviceCardRefs CreateConnectedCard(const std::wstring& id, const DeviceInformati
 			// Remove from the map BEFORE Close() so the StateChanged callback
 			// does not treat this as a link drop and start an auto-reconnect.
 			g_audioPlaybackConnections.erase(it);
+			g_bluetoothLinkWatch.erase(deviceId);
 			connection.Close();
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 			UpdateNotifyIcon();
@@ -2580,6 +2831,7 @@ DeviceCardRefs CreateConnectedCard(const std::wstring& id, const DeviceInformati
 			// Remove from the map BEFORE Close() so this user-initiated
 			// disconnect is not mistaken for a link drop and auto-reconnected.
 			g_audioPlaybackConnections.erase(it);
+			g_bluetoothLinkWatch.erase(deviceId);
 			connection.Close();
 			PostMessageW(g_hWnd, WM_REFRESHDEVICELIST, 0, 0);
 			UpdateNotifyIcon();
